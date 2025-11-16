@@ -1,0 +1,6 @@
+# secrets and local artifacts
+licenses.json
+*.csv
+.env
+.venv/
+__pycache__/

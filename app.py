@@ -77,6 +77,28 @@ SCOPES = [
 CLIENT_FILE = os.getenv("GOOGLE_CLIENT_SECRET_FILE", "client_secret.json")
 TOKEN_FILE = os.getenv("GOOGLE_OAUTH_TOKEN_FILE", "token.json")
 
+# --- Streamlit Cloud OAuth bootstrap (no local browser) ---
+# Store your client_secret.json and token.json in Streamlit Secrets as:
+#   GOOGLE_CLIENT_SECRET_JSON = """{...}"""
+#   GOOGLE_OAUTH_TOKEN_JSON   = """{...}"""
+# This writes them to files at runtime so yt_oauth_clients() can load them.
+def _write_oauth_files_from_secrets():
+    try:
+        cs = st.secrets.get("GOOGLE_CLIENT_SECRET_JSON", "")
+        tk = st.secrets.get("GOOGLE_OAUTH_TOKEN_JSON", "")
+        if cs and not os.path.exists(CLIENT_FILE):
+            with open(CLIENT_FILE, "w", encoding="utf-8") as f:
+                f.write(cs)
+        if tk:
+            with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+                f.write(tk)
+    except Exception:
+        # If secrets aren't configured, keep running (local dev will use files on disk)
+        pass
+
+_write_oauth_files_from_secrets()
+
+
 LICENSE_FILE = os.getenv("LICENSE_STORE_FILE", "licenses.json")
 OWNER_PASSWORD = (os.getenv("OWNER_PASSWORD") or "").strip()
 OWNER_LICENSE_KEY = (os.getenv("OWNER_LICENSE_KEY") or "").strip()

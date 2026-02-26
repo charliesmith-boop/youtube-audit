@@ -1658,6 +1658,101 @@ def build_elite_pdf(channel: dict, videos: list[dict], kpis: dict, insights: lis
     return buf.read()
 
 
+def build_competition_roadmap_pdf(context: dict, diagnosis: list[str], fixes: list[dict], plan: list[str]) -> bytes:
+    """Client-ready 14-day roadmap PDF for the Competition tab."""
+    W, H = A4
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+
+    X0 = 40
+    y = H - 40
+    ROWH = 12
+
+    def draw_line(x, y, txt, font="Helvetica", size=10):
+        c.setFont(font, size)
+        c.drawString(x, y, txt)
+
+    def new_page():
+        c.showPage()
+        return H - 40
+
+    brand = str(context.get("brand") or "YouTube Audit Pro").strip()
+    you_label = str(context.get("you") or "You").strip()[:80]
+    rival_label = str(context.get("rival") or "Competitor").strip()[:80]
+    gen = str(context.get("generated") or datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+
+    draw_line(X0, y, f"{brand} — COMPETITION ROADMAP (14 DAYS)", "Helvetica-Bold", 16)
+    y -= 18
+    draw_line(X0, y, f"Generated: {gen}", "Helvetica", 10)
+    y -= 14
+    draw_line(X0, y, f"Comparison: {you_label} vs {rival_label}", "Helvetica", 10)
+    y -= 18
+
+    # Section: What’s happening
+    draw_line(X0, y, "WHAT’S HAPPENING", "Helvetica-Bold", 12)
+    y -= 14
+    if not diagnosis:
+        diagnosis = ["No major gap detected. Focus on consistency and clarity for small repeatable gains."]
+    for d in diagnosis[:5]:
+        for chunk in _wrap(f"• {d}", 95):
+            draw_line(X0 + 10, y, chunk)
+            y -= ROWH
+            if y < 60:
+                y = new_page()
+    y -= 8
+
+    # Section: Top fixes
+    draw_line(X0, y, "TOP FIXES (DO THESE FIRST)", "Helvetica-Bold", 12)
+    y -= 14
+    if not fixes:
+        fixes = [
+            {"title":"Consistency", "why":"Predictable posting helps the algorithm build stable recommendations.", "action":"Pick 2 fixed days and post twice per week for 30 days."},
+            {"title":"Title clarity", "why":"Clear outcomes increase clicks and bring the right viewers.", "action":"Aim for 45–65 characters and lead with the result."},
+            {"title":"Fast start", "why":"If the first 10 seconds don’t pay off, retention drops and reach is capped.", "action":"Open with outcome + proof, then steps."},
+        ]
+    for fx in fixes[:3]:
+        draw_line(X0 + 10, y, f"- {fx.get('title','')}", "Helvetica-Bold", 10)
+        y -= ROWH
+        for chunk in _wrap(str(fx.get("why","")), 95):
+            draw_line(X0 + 18, y, chunk, "Helvetica", 10)
+            y -= ROWH
+            if y < 60:
+                y = new_page()
+        for chunk in _wrap("Action: " + str(fx.get("action","")), 95):
+            draw_line(X0 + 18, y, chunk, "Helvetica", 10)
+            y -= ROWH
+            if y < 60:
+                y = new_page()
+        y -= 6
+        if y < 60:
+            y = new_page()
+    y -= 4
+
+    # Section: 14-day plan
+    draw_line(X0, y, "YOUR 14-DAY PLAN", "Helvetica-Bold", 12)
+    y -= 14
+    for i, step in enumerate(plan or [], start=1):
+        for chunk in _wrap(f"{i}. {step}", 95):
+            draw_line(X0 + 10, y, chunk)
+            y -= ROWH
+            if y < 60:
+                y = new_page()
+
+    y -= 8
+    draw_line(X0, y, "NOTE", "Helvetica-Bold", 10)
+    y -= 12
+    for chunk in _wrap("After 14 days, re-run Competition + Audience Retention to confirm the gap is closing, then iterate.", 95):
+        draw_line(X0 + 10, y, chunk)
+        y -= ROWH
+        if y < 60:
+            y = new_page()
+
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
+
 # ---------------------------------------------------------------------
 # Audience retention helpers (UNCHANGED)
 # ---------------------------------------------------------------------
@@ -2106,45 +2201,309 @@ with tabs[1]:
             "Upgrade to unlock Competition.",
         )
     else:
+
         st.subheader("Competition")
+
         base_input = st.text_input("Your Channel URL/ID", value="https://www.youtube.com/@ImanGadzhi", key="comp_you")
         compA_input = st.text_input("Competitor A URL/ID", value="https://www.youtube.com/@AlexHormozi", key="comp_a")
         compB_input = st.text_input("Competitor B URL/ID", value="", key="comp_b")
         comp_n = st.slider("Recent videos per channel", 3, 40, 5, key="comp_n")
 
+        def _safe_float(x, default=0.0):
+            try:
+                if x is None or (isinstance(x, float) and np.isnan(x)):
+                    return default
+                return float(x)
+            except Exception:
+                return default
+
+        def _safe_int(x, default=0):
+            try:
+                if x is None or (isinstance(x, float) and np.isnan(x)):
+                    return default
+                return int(x)
+            except Exception:
+                return default
+
+        def _bucket(val: float, lo: float, hi: float):
+            # 3-bucket label
+            if hi <= lo:
+                return "Medium"
+            t = (val - lo) / (hi - lo)
+            if t >= 0.67:
+                return "High"
+            if t <= 0.33:
+                return "Low"
+            return "Medium"
+
         if st.button("Run Comparison"):
             yt = yt_key_service()
             rows = []
+            label_map = {"You": "You", "A": "Competitor A", "B": "Competitor B"}
+
             for who, inp in [("You", base_input), ("A", compA_input), ("B", compB_input)]:
-                if not inp.strip():
+                if not (inp or "").strip():
                     continue
+
                 cid = resolve_channel_id(yt, inp) or parse_channel_or_id(inp)
                 if not cid:
                     continue
+
                 up = fetch_recent_videos(yt, cid, comp_n)
+                if up is None or up.empty:
+                    continue
+
                 stt = fetch_video_stats(yt, up["video_id"].tolist())
+                if stt is None or stt.empty:
+                    continue
+
                 merged = stt.merge(
                     up[["video_id", "published", "title"]],
                     on="video_id",
                     how="left",
                     suffixes=("", "_upl"),
                 )
+
                 if "title_upl" in merged.columns:
                     merged["title"] = merged["title"].fillna(merged["title_upl"])
                     merged.drop(columns=["title_upl"], inplace=True)
+
                 merged = engagement_rates(view_velocity(merged))
-                merged.insert(0, "who", who)
+                merged.insert(0, "who", label_map.get(who, who))
                 rows.append(merged)
 
             if not rows:
                 st.warning("No channels resolved.")
             else:
                 comp_df = pd.concat(rows, ignore_index=True)
-                st.dataframe(
-                    comp_df[["who", "title", "views", "likes", "comments", "published", "views_per_min", "like_rate_%"]],
-                    use_container_width=True,
-                    height=340,
+
+                # ----------------------------
+                # Channel-level summaries
+                # ----------------------------
+                def _channel_summary(df: pd.DataFrame) -> dict:
+                    if df is None or df.empty:
+                        return {
+                            "uploads_week": 0.0,
+                            "median_gap_days": np.nan,
+                            "consistency_100": 0,
+                            "avg_like_rate": 0.0,
+                            "avg_views_per_day": 0.0,
+                            "avg_title_len": 0.0,
+                            "n": 0,
+                        }
+                    cad = cadence_stats(df)
+                    title_len = df["title"].fillna("").astype(str).str.len()
+                    views_per_day = (df["views"] / (df["age_min"].clip(lower=1) / 1440.0)).replace([np.inf, -np.inf], np.nan)
+                    return {
+                        "uploads_week": _safe_float(cad.get("uploads_week", 0.0), 0.0),
+                        "median_gap_days": _safe_float(cad.get("median_gap_days", np.nan), np.nan),
+                        "consistency_100": _safe_int(cad.get("consistency_100", 0), 0),
+                        "avg_like_rate": _safe_float(df["like_rate_%"].replace([np.inf, -np.inf], np.nan).mean(), 0.0),
+                        "avg_views_per_day": _safe_float(views_per_day.mean(), 0.0),
+                        "avg_title_len": _safe_float(title_len.mean(), 0.0),
+                        "n": int(len(df)),
+                    }
+
+                you_df = comp_df[comp_df["who"] == "You"]
+                a_df = comp_df[comp_df["who"] == "Competitor A"]
+                b_df = comp_df[comp_df["who"] == "Competitor B"]
+
+                you_s = _channel_summary(you_df)
+                a_s = _channel_summary(a_df)
+                b_s = _channel_summary(b_df)
+
+                rivals = [("Competitor A", a_s), ("Competitor B", b_s)]
+                rivals = [(name, s) for name, s in rivals if s["n"] > 0]
+
+                # Pick the strongest rival by momentum (views/day)
+                top_rival_name, top_rival = (None, None)
+                if rivals:
+                    top_rival_name, top_rival = max(rivals, key=lambda x: x[1].get("avg_views_per_day", 0.0))
+
+                # ----------------------------
+                # Narrative: What’s happening
+                # ----------------------------
+                st.markdown("### What’s happening")
+
+                diagnosis = []
+                fixes = []
+
+                def add_fix(title: str, why: str, action: str):
+                    fixes.append({"title": title, "why": why, "action": action})
+
+                if top_rival and you_s["n"] > 0:
+                    # Cadence gap
+                    if top_rival["uploads_week"] > max(0.01, you_s["uploads_week"]) * 1.25:
+                        diagnosis.append("Competitors post more consistently, which helps YouTube trust the channel and push videos faster.")
+                        add_fix(
+                            "Consistency",
+                            f"You post ~{you_s['uploads_week']:.1f}/week vs {top_rival['uploads_week']:.1f}/week for {top_rival_name}.",
+                            "Pick 2 fixed days and post twice per week for 30 days (even if one is a shorter video).",
+                        )
+                    # Title clarity (length proxy)
+                    if top_rival["avg_title_len"] < max(1.0, you_s["avg_title_len"]) * 0.9:
+                        diagnosis.append("Competitors use shorter, clearer titles that communicate the payoff faster.")
+                        add_fix(
+                            "Title clarity",
+                            f"Your average title length is ~{you_s['avg_title_len']:.0f} chars vs ~{top_rival['avg_title_len']:.0f} chars.",
+                            "Aim for 45–65 characters. Put the outcome in the first 6–8 words.",
+                        )
+                    # Engagement
+                    if top_rival["avg_like_rate"] > max(0.01, you_s["avg_like_rate"]) * 1.15:
+                        diagnosis.append("Competitors get stronger engagement signals, which supports reach and suggested traffic.")
+                        add_fix(
+                            "Engagement signals",
+                            f"Your average engagement is ~{you_s['avg_like_rate']:.2f}% vs ~{top_rival['avg_like_rate']:.2f}%.",
+                            "Add a single clear CTA: ask a question within the first 20s + pin it in the comments.",
+                        )
+                    # Momentum
+                    if top_rival["avg_views_per_day"] > max(0.01, you_s["avg_views_per_day"]) * 1.25:
+                        diagnosis.append("Competitors gain momentum faster (more views per day), which compounds into more impressions.")
+                        add_fix(
+                            "Early momentum",
+                            f"Your recent videos average ~{you_s['avg_views_per_day']:.0f} views/day vs ~{top_rival['avg_views_per_day']:.0f} views/day.",
+                            "On the next upload: tighten the first 10 seconds, remove intro fluff, and show proof early (result, screenshot, before/after).",
+                        )
+
+                if not diagnosis:
+                    diagnosis.append("Your numbers are broadly in the same range. The quickest wins will come from consistency and clearer titles.")
+
+                for d in diagnosis[:3]:
+                    st.markdown(f"- {d}")
+
+                # ----------------------------
+                # What this costs you (soft)
+                # ----------------------------
+                st.markdown("### What this is costing you")
+                if top_rival and you_s["n"] > 0:
+                    vpd_gap = max(0.0, top_rival["avg_views_per_day"] - you_s["avg_views_per_day"])
+                    if vpd_gap > 0:
+                        st.markdown(f"- Slower momentum: roughly **{vpd_gap:,.0f} fewer views/day** vs {top_rival_name} on recent uploads.")
+                    if you_s["uploads_week"] > 0:
+                        st.markdown("- Inconsistent uploads make it harder for the algorithm to build stable recommendations.")
+                    st.markdown("- The fix is usually simple: tighten the plan, run it for 30 days, then re-check the gap.")
+                else:
+                    st.markdown("- Without at least 1 competitor channel, we can’t estimate gaps. Add a competitor to get a clearer plan.")
+
+                # ----------------------------
+                # What to do next (3 fixes max)
+                # ----------------------------
+                st.markdown("### What to do next")
+
+                if not fixes:
+                    add_fix(
+                        "Consistency",
+                        "Even small channels grow faster when YouTube sees a predictable upload rhythm.",
+                        "Choose 2 days per week and post on those days for 30 days.",
+                    )
+                    add_fix(
+                        "Title clarity",
+                        "Clear outcome titles increase clicks and help the right viewers choose your video.",
+                        "Keep titles 45–65 chars and lead with the result/benefit.",
+                    )
+                    add_fix(
+                        "Fast start",
+                        "If the first 10 seconds don’t pay off, retention drops and reach gets capped.",
+                        "Open with the outcome + proof, then explain the steps.",
+                    )
+
+                cols = st.columns(3)
+                for i, fx in enumerate(fixes[:3]):
+                    with cols[i]:
+                        st.markdown(f"**{fx['title']}**")
+                        st.caption(fx["why"])
+                        st.markdown(f"👉 {fx['action']}")
+
+                # 14-day plan generator (simple, copy-paste)
+                def _make_plan(you_best_day: str | None = None):
+                    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                    # default schedule: Tue/Fri (safe), or shift if best_day available
+                    pick = ["Tue", "Fri"]
+                    if you_best_day and you_best_day in days:
+                        # choose best day + 3 days later
+                        idx = days.index(you_best_day)
+                        pick = [you_best_day, days[(idx + 3) % 7]]
+                    return [
+                        f"Week 1: Post on {pick[0]} + {pick[1]} (2 uploads).",
+                        "Week 1: Titles 45–65 chars. Outcome first.",
+                        "Week 1: Hook: outcome + proof in first 10s.",
+                        f"Week 2: Post on {pick[0]} + {pick[1]} (2 uploads).",
+                        "Week 2: Repeat the strongest title pattern from week 1.",
+                        "Week 2: Add 1 pattern-break at ~45s (graphic, cut, new example).",
+                        "After 14 days: re-run Competition + Retention to verify improvement.",
+                    ]
+
+                # Best day from cadence_stats if available
+                try:
+                    you_best_day = cadence_stats(you_df).get("best_day") if not you_df.empty else None
+                except Exception:
+                    you_best_day = None
+                plan = _make_plan(you_best_day)
+
+                # Roadmap PDF (client-ready)
+                ctx = {
+                "brand": brand_name,
+                "you": "You",
+                "rival": top_rival_name or "Competitor",
+                "generated": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+                }
+                roadmap_pdf = build_competition_roadmap_pdf(ctx, diagnosis, fixes[:3], plan)
+
+                st.download_button(
+                "Download 14-day Roadmap PDF",
+                data=roadmap_pdf,
+                file_name="Competition_Roadmap_14_Days.pdf",
+                mime="application/pdf",
                 )
+
+                with st.expander("Show the 14-day plan (text)"):
+                    st.write("\n".join([f"- {p}" for p in plan]))
+                st.markdown("---")
+
+                # ----------------------------
+                # Evidence table (bottom)
+                # ----------------------------
+                st.markdown("### Evidence (raw comparison)")
+                df = comp_df.copy()
+
+                # Friendly columns
+                df["published_dt"] = pd.to_datetime(df.get("published"), utc=True, errors="coerce")
+                df["published"] = df["published_dt"].dt.strftime("%Y-%m-%d").fillna("")
+                df["title_len"] = df["title"].fillna("").astype(str).str.len()
+
+                df["views_per_day"] = (df["views"] / (df["age_min"].clip(lower=1) / 1440.0)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                # Per-channel bucket for momentum + engagement
+                friendly = []
+                for who_name, g in df.groupby("who", dropna=False):
+                    g = g.copy()
+                    v_lo, v_hi = float(g["views_per_day"].min()), float(g["views_per_day"].max())
+                    e_lo, e_hi = float(g["like_rate_%"].min()), float(g["like_rate_%"].max())
+                    g["Momentum"] = g["views_per_day"].apply(lambda x: _bucket(float(x), v_lo, v_hi))
+                    g["Engagement"] = g["like_rate_%"].apply(lambda x: _bucket(_safe_float(x, 0.0), e_lo, e_hi))
+                    friendly.append(g)
+
+                out = pd.concat(friendly, ignore_index=True) if friendly else df
+
+                show_cols = ["who", "published", "title", "views", "Momentum", "Engagement", "views_per_day", "like_rate_%", "title_len"]
+                # keep only what exists
+                show_cols = [c for c in show_cols if c in out.columns]
+                out = out[show_cols].rename(
+                    columns={
+                        "who": "Channel",
+                        "published": "Published",
+                        "title": "Title",
+                        "views": "Views",
+                        "views_per_day": "Views/day",
+                        "like_rate_%": "Like rate (%)",
+                        "title_len": "Title length",
+                    }
+                )
+
+                # Format (safe)
+                try:
+                    st.dataframe(out, use_container_width=True, height=360)
+                except Exception:
+                    st.dataframe(out.astype(str), use_container_width=True, height=360)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2438,723 +2797,66 @@ with tabs[4]:
             "Upgrade to unlock Video Ideas.",
         )
     else:
-        st.subheader("Video Ideas — Niche Intelligence Engine")
+        st.subheader("Video Ideas")
+        chan_in = st.text_input("Channel (URL, @handle, or ID)", value="https://www.youtube.com/@ImanGadzhi")
+        how_many = st.slider("How many?", 5, 25, 8)
 
-        # -------------------------------
-        # Video Ideas: defensive schema
-        # -------------------------------
-        _VI_REQUIRED = {
-            "video_id": "",
-            "title": "",
-            "published": pd.NaT,
-            "seed": "",
-            "views": 0,
-            "channel_title": "",
-        }
+        def _clean_term(t: str) -> str:
+            t = re.sub(r"[^A-Za-z0-9 ']+", " ", (t or "")).strip().lower()
+            stop = {"make", "made", "doing", "do", "this", "that", "thing", "stuff", "way", "ways", "day", "best"}
+            words = [w for w in t.split() if w not in stop]
+            s = " ".join(words).strip()
+            return s.title() if s else "Strategy"
 
-        def _vi_normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-            """Normalize schema for Video Ideas pipeline. Never throws."""
-            if df is None or not isinstance(df, pd.DataFrame):
-                df = pd.DataFrame()
-            df = df.copy()
+        def _cap60(s: str) -> str:
+            return s if len(s) <= 60 else s[:57].rstrip() + "..."
 
-            # Common alias lifts
-            alias_map = {
-                "video_id": ["videoId", "id", "vid", "videoID"],
-                "title": ["video_title", "videoTitle", "name"],
-                "published": ["publishedAt", "published_at", "publish_time", "date"],
-                "seed": ["seed_query", "seed_term", "seed_keyword"],
-                "views": ["viewCount", "view_count"],
-                "channel_title": ["channelTitle", "channel", "channel_name"],
-            }
-            for canonical, aliases in alias_map.items():
-                if canonical in df.columns:
-                    continue
-                for a in aliases:
-                    if a in df.columns:
-                        df[canonical] = df[a]
-                        break
+        templates = [
+            "How I Made £{num} With {seed}",
+            "{seed}: 7 Simple Steps",
+            "From 0 to 1,000 Subs Using {seed}",
+            "Do This Before Starting {seed}",
+            "Stop Doing This With {seed}",
+            "The Truth About {seed}",
+            "3 Mistakes Killing Your {seed}",
+            "{seed} vs {alt}: What Works Now",
+            "The Ultimate {seed} Guide",
+            "{seed} For Beginners: Complete Setup",
+            "Scale Faster With {seed}",
+            "I Tried {seed} For 30 Days",
+            "Avoid These {seed} Traps",
+            "£0 To £1,000 With {seed}",
+            "My Exact {seed} Workflow",
+        ]
+        alts = ["SEO", "Ads", "Automation", "Funnels", "Content", "Emails"]
+        nums = ["100", "500", "1,000", "10,000"]
 
-            # Merge suffix repair (pandas adds _x/_y)
-            if "title" not in df.columns:
-                for a in ("title_x", "title_y"):
-                    if a in df.columns:
-                        df["title"] = df[a]
-                        break
-            if "published" not in df.columns:
-                for a in ("published_x", "published_y", "publishedAt"):
-                    if a in df.columns:
-                        df["published"] = df[a]
-                        break
-            if "channel_title" not in df.columns:
-                for a in ("channel_title_x", "channel_title_y", "channelTitle"):
-                    if a in df.columns:
-                        df["channel_title"] = df[a]
-                        break
-
-            # Ensure required columns exist with safe defaults
-            for col, default in _VI_REQUIRED.items():
-                if col not in df.columns:
-                    df[col] = default
-
-            # Type normalisation
-            df["video_id"] = df["video_id"].fillna("").astype(str)
-            df["title"] = df["title"].fillna("").astype(str)
-            # published can be str or datetime
-            df["published"] = pd.to_datetime(df["published"], utc=True, errors="coerce")
-            df["seed"] = df["seed"].fillna("").astype(str)
-
-            # views numeric
-            df["views"] = pd.to_numeric(df["views"], errors="coerce").fillna(0).astype(int)
-            df["channel_title"] = df["channel_title"].fillna("").astype(str)
-
-            return df
-
-
-        colA, colB, colC = st.columns([2.2, 1.0, 1.0])
-        with colA:
-            chan_in = st.text_input("Channel (URL, @handle, or ID)", value="https://www.youtube.com/@ImanGadzhi", key="vi_chan")
-        with colB:
-            region_label = st.selectbox("Region", ["UK", "US", "Global"], index=0, key="vi_region")
-        with colC:
-            days = st.selectbox("Freshness window", [7, 30, 90], index=1, key="vi_days")
-
-        comp_in = st.text_input("Competitor (optional) — URL/ID", value="", key="vi_comp")
-        how_many = st.slider("Ideas", 6, 30, 12, key="vi_n")
-
-        include_kw = st.text_input("Include keywords/topics (comma separated, optional)", value="", key="vi_kw")
-
-        output_mode = st.radio("Output", ["Titles only", "Briefs (expand for details)"], index=0, horizontal=True, key="vi_out")
-
-        st.markdown("### How to use this")
-        st.markdown(
-            f"- Pulls ideas from what’s performing **right now** in your niche (last **{days} days**).\n"
-            f"- Starts with the highest **Niche Match** ideas first (not random viral).\n"
-            f"- Keep it simple: pick 3 titles, film this week, then repeat what works."
-        )
-
-        STOP = {
-            "a","an","the","and","or","but","if","then","this","that","these","those","to","of","in","on","for","with","at","by","from",
-            "is","are","was","were","be","been","being","it","its","as","into","over","under","than","too","very","you","your","we","our",
-            "i","me","my","they","their","them","he","she","his","her","what","why","how","when","where","who","which","do","does","did",
-            "make","made","making","get","got","getting","day","days","week","weeks","year","years","now","new","best","top","vs","v",
-        }
-
-        def _tok(s: str) -> list[str]:
-            s = (s or "").lower()
-            s = re.sub(r"[^a-z0-9\s']", " ", s)
-            parts = [p.strip("'") for p in s.split() if p.strip("'")]
-            return [p for p in parts if p not in STOP and len(p) > 2 and not p.isdigit()]
-
-        def _ngrams(tokens: list[str], n: int) -> list[str]:
-            return [" ".join(tokens[i:i+n]) for i in range(0, max(0, len(tokens)-n+1))]
-
-        def _views_per_day(df: pd.DataFrame) -> pd.DataFrame:
-            d = df.copy()
-            d["published_dt"] = pd.to_datetime(d["published"], errors="coerce", utc=True)
-            age_days = (pd.Timestamp.utcnow() - d["published_dt"]).dt.total_seconds() / 86400.0
-            age_days = age_days.clip(lower=1.0)
-            d["views_per_day"] = (pd.to_numeric(d.get("views", 0), errors="coerce").fillna(0) / age_days)
-            return d
-
-        def _parse_iso8601_duration(dur: str) -> int:
-            # PT#H#M#S
-            if not dur or not dur.startswith("PT"):
-                return 0
-            h = m = s = 0
-            m1 = re.search(r"(\d+)H", dur)
-            m2 = re.search(r"(\d+)M", dur)
-            m3 = re.search(r"(\d+)S", dur)
-            if m1: h = int(m1.group(1))
-            if m2: m = int(m2.group(1))
-            if m3: s = int(m3.group(1))
-            return h*3600 + m*60 + s
-
-        @st.cache_data(show_spinner=False, ttl=60*60)
-        def _fetch_durations(_yt, video_ids: list[str]) -> dict:
-            out = {}
-            # chunk 50
-            for i in range(0, len(video_ids), 50):
-                chunk = video_ids[i:i+50]
-                r = _yt.videos().list(part="contentDetails", id=",".join(chunk), maxResults=50).execute()
-                for it in r.get("items", []):
-                    vid = it.get("id")
-                    dur = it.get("contentDetails", {}).get("duration", "")
-                    out[vid] = _parse_iso8601_duration(dur)
-            return out
-
-        def _fingerprint_terms(title_series: list[str], weight_series: list[float]) -> tuple[dict, set, set]:
-            # weighted n-grams (2-3)
-            w = {}
-            unigrams = set()
-            bigrams = set()
-            for t, wt in zip(title_series, weight_series):
-                toks = _tok(t)
-                for u in toks:
-                    unigrams.add(u)
-                    w[u] = w.get(u, 0.0) + wt
-                for bg in _ngrams(toks, 2):
-                    if len(bg) >= 8:
-                        bigrams.add(bg)
-                        w[bg] = w.get(bg, 0.0) + wt * 1.8
-                for tg in _ngrams(toks, 3):
-                    if len(tg) >= 12:
-                        w[tg] = w.get(tg, 0.0) + wt * 2.2
-            # top terms
-            top = dict(sorted(w.items(), key=lambda x: x[1], reverse=True)[:120])
-            return top, unigrams, bigrams
-
-        def _pick_queries(term_weights: dict) -> list[str]:
-            # Prefer multi-word phrases; avoid overly generic single terms
-            phrases = [k for k in term_weights.keys() if " " in k and 8 <= len(k) <= 32]
-            # keep top 10 phrases
-            return phrases[:10] if phrases else list(term_weights.keys())[:8]
-
-        def _is_spam_title(t: str) -> bool:
-            tl = (t or "").lower()
-            if "#" in tl:
-                return True
-            bad = ["shorts", "tiktok", "trending", "viral", "official video", "mv", "music video", "trailer", "full movie", "song", "lyrics"]
-            if any(b in tl for b in bad):
-                return True
-            # too many non-ascii / emojis
-            non_ascii = sum(1 for ch in (t or "") if ord(ch) > 127)
-            if non_ascii > 6:
-                return True
-            return False
-
-        def _niche_match_score(title: str, uni: set, bi: set, top_terms: dict) -> float:
-            toks = _tok(title)
-            if not toks:
-                return 0.0
-            uni_hits = sum(1 for x in toks if x in uni)
-            bi_hits = 0
-            bgs = _ngrams(toks, 2)
-            for bg in bgs:
-                if bg in bi:
-                    bi_hits += 1
-            # weighted sum with term weights
-            wsum = 0.0
-            for x in toks:
-                wsum += top_terms.get(x, 0.0)
-            for bg in bgs:
-                wsum += top_terms.get(bg, 0.0)
-            # normalize
-            return (uni_hits * 1.0 + bi_hits * 2.2 + (wsum / (max(1.0, sum(top_terms.values())/50.0)))) / (len(toks) + 2.0)
-
-        @st.cache_data(show_spinner=False, ttl=60*60)
-        def _search_trends(_yt, query: str, days: int, region_code: str | None, max_results: int = 18) -> list[dict]:
-            after = (pd.Timestamp.utcnow() - pd.Timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            kwargs = dict(part="snippet", q=query, type="video", order="viewCount", maxResults=max_results, publishedAfter=after)
-            if region_code:
-                kwargs["regionCode"] = region_code
-            r = _yt.search().list(**kwargs).execute()
-            out = []
-            for it in r.get("items", []):
-                vid = (it.get("id") or {}).get("videoId")
-                sn = it.get("snippet") or {}
-                if not vid:
-                    continue
-                out.append({
-                    "video_id": vid,
-                    "title": sn.get("title", ""),
-                    "published": sn.get("publishedAt", ""),
-                    "channel_title": sn.get("channelTitle", ""),
-                    "seed": query,
-                })
-            return out
-
-        def _format_type(t: str) -> str:
-            tl = (t or "").lower()
-            if "how to" in tl or tl.startswith("how "):
-                return "How-to"
-            if "vs" in tl or " vs " in tl:
-                return "Versus"
-            if "mistake" in tl or "mistakes" in tl:
-                return "Mistakes"
-            if "truth" in tl or "nobody tells" in tl or "what they don't" in tl:
-                return "Truth"
-            if any(x in tl for x in ["framework", "system", "rules", "steps", "habits"]):
-                return "Framework"
-            if any(x in tl for x in ["i tried", "for 30 days", "i tested", "challenge"]):
-                return "Experiment"
-            return "Strategy"
-
-        def _title_variants(seed_phrase: str, fmt: str) -> tuple[str, str, str]:
-            seed = seed_phrase.title()
-            # tighten seed if too long
-            if len(seed) > 38:
-                seed = seed[:35].rstrip() + "..."
-            if fmt == "How-to":
-                p1 = f"How to Win With {seed} (Step-by-Step)"
-                p2 = f"{seed}: The Simple System That Works"
-                p3 = f"Do This Before You Try {seed}"
-            elif fmt == "Mistakes":
-                p1 = f"3 Mistakes Killing Your {seed}"
-                p2 = f"Stop Doing {seed} Like This"
-                p3 = f"The {seed} Trap Nobody Talks About"
-            elif fmt == "Truth":
-                p1 = f"The Truth About {seed} in 2026"
-                p2 = f"{seed} Isn’t Working (Here’s Why)"
-                p3 = f"What Nobody Tells You About {seed}"
-            elif fmt == "Framework":
-                p1 = f"The {seed} Framework That Actually Works"
-                p2 = f"{seed}: 7 Rules to Follow"
-                p3 = f"My Exact {seed} Checklist"
-            elif fmt == "Experiment":
-                p1 = f"I Tried {seed} for 30 Days (Results)"
-                p2 = f"What Happened When I Focused on {seed}"
-                p3 = f"{seed} for 30 Days: My System"
-            else:
-                p1 = f"{seed}: What Works Right Now"
-                p2 = f"Do This to Improve Your {seed}"
-                p3 = f"The Fastest Way to Get Results With {seed}"
-            return p1, p2, p3
-
-        def _clean_title_display(s: str) -> str:
-            s = (s or "").strip()
-            s = re.sub(r"#\w+", "", s)
-            s = re.sub(r"[^\w\s£$€:,'’\-–—\.\?\!\(\)]", "", s)
-            s = re.sub(r"\s{2,}", " ", s).strip()
-            return s if len(s) <= 80 else (s[:77].rstrip() + "...")
-
-        if st.button("Generate briefs", key="vi_go"):
+        if st.button("Generate"):
             yt = yt_key_service()
             cid = resolve_channel_id(yt, chan_in) or parse_channel_or_id(chan_in)
             if not cid:
                 st.error("Could not resolve channel")
             else:
-                # Region mapping
-                region_code = {"UK": "GB", "US": "US", "Global": None}.get(region_label, None)
+                base = fetch_recent_videos(yt, cid, 40)
+                titles = base["title"].tolist()
+                dens = keyword_density(titles).head(12)
+                seeds = (dens.index.tolist() or ["automation", "content", "offers", "ads"])[:12]
 
-                # Base corpus
-                base = fetch_recent_videos(yt, cid, 70)
-                base_stats = fetch_video_stats(yt, base["video_id"].tolist())
-                base = base.merge(base_stats, on="video_id", how="left")
-                base = _views_per_day(base)
+                ideas = []
+                used = set()
+                i = 0
+                while len(ideas) < how_many and i < 100:
+                    i += 1
+                    raw = _clean_term(seeds[(len(ideas) + i) % len(seeds)])
+                    alt = alts[(len(ideas) + i) % len(alts)]
+                    num = nums[(len(ideas) + i) % len(nums)]
+                    t = templates[(len(ideas) + i) % len(templates)]
+                    title = _cap60(t.format(seed=raw, alt=alt, num=num))
+                    title = re.sub(r"\b(Make|Made)\s+Made\b", "Made", title, flags=re.I)
+                    if title not in used:
+                        ideas.append(title)
+                        used.add(title)
 
-                # Optional competitor enrich
-                if comp_in.strip():
-                    ccid = resolve_channel_id(yt, comp_in) or parse_channel_or_id(comp_in)
-                    if ccid:
-                        comp = fetch_recent_videos(yt, ccid, 50)
-                        comp_stats = fetch_video_stats(yt, comp["video_id"].tolist())
-                        comp = comp.merge(comp_stats, on="video_id", how="left")
-                        comp = _views_per_day(comp)
-                        base = pd.concat([base, comp], ignore_index=True)
+                st.write("\n".join([f"- {i}" for i in ideas]))
 
-                # Ensure we have a usable title column after merges (avoid KeyError if pandas adds suffixes)
-                if "title" not in base.columns:
-                    for _c in ("title_x", "title_y", "video_title", "snippet_title", "name"):
-                        if _c in base.columns:
-                            base["title"] = base[_c]
-                            break
-                    else:
-                        base["title"] = ""
-                titles = base["title"].fillna("").astype(str).tolist()
-                weights = base["views_per_day"].fillna(0).astype(float).tolist()
-
-                top_terms, uni, bi = _fingerprint_terms(titles, weights)
-                queries = _pick_queries(top_terms)
-
-                # Pull trend candidates
-                cand = []
-                for q in queries[:8]:
-                    cand.extend(_search_trends(yt, q, int(days), region_code, max_results=18))
-
-                cand_df = pd.DataFrame(cand)
-                # Defensive schema: if search returns nothing, stop early
-                if cand_df.empty:
-                    st.warning("No trend candidates found. Try a shorter freshness window or broaden region.")
-                else:
-                    # Ensure required columns exist (avoids KeyError cascades)
-                    if "video_id" not in cand_df.columns:
-                        for _c in ("videoId", "id", "vid"):
-                            if _c in cand_df.columns:
-                                cand_df["video_id"] = cand_df[_c]
-                                break
-                    if "video_id" not in cand_df.columns:
-                        st.warning("Could not read video IDs from trend search results.")
-                    else:
-                        cand_df = cand_df.drop_duplicates(subset=["video_id"])
-                        # Ensure title/published/seed fields exist even if upstream schema changes
-                        if "title" not in cand_df.columns:
-                            for _c in ("title_x","title_y","video_title","snippet_title","name"):
-                                if _c in cand_df.columns:
-                                    cand_df["title"] = cand_df[_c]
-                                    break
-                            else:
-                                cand_df["title"] = ""
-                        if "published" not in cand_df.columns:
-                            if "publishedAt" in cand_df.columns:
-                                cand_df["published"] = cand_df["publishedAt"]
-                            else:
-                                cand_df["published"] = ""
-                        if "seed" not in cand_df.columns:
-                            if "query" in cand_df.columns:
-                                cand_df["seed"] = cand_df["query"]
-                            else:
-                                cand_df["seed"] = ""
-                    stats = fetch_video_stats(yt, cand_df["video_id"].tolist())
-                    cand_df = cand_df.merge(stats, on="video_id", how="left")
-                    durs = _fetch_durations(yt, cand_df["video_id"].tolist())
-                    cand_df["duration_s"] = cand_df["video_id"].map(lambda x: durs.get(x, 0))
-
-                    cand_df = _views_per_day(cand_df)
-
-                    # Hard filters
-                    cand_df = _vi_normalize_df(cand_df)
-                    cand_df = cand_df[ cand_df["duration_s"] >= 360 ]
-                    cand_df = cand_df[ ~cand_df["title"].fillna("").apply(_is_spam_title) ]
-                    if cand_df.empty:
-                        st.warning("Trends were found, but nothing matched your niche after filters. Try 90 days or add a competitor.")
-                    else:
-                        # Niche match + demand score
-                        cand_df["niche_match"] = cand_df["title"].apply(lambda t: _niche_match_score(str(t), uni, bi, top_terms))
-                        # normalize demand
-                        vmax = float(cand_df["views_per_day"].max() or 1.0)
-                        cand_df["demand"] = cand_df["views_per_day"].astype(float) / vmax
-                        cand_df["score"] = (cand_df["niche_match"] * 0.65 + cand_df["demand"] * 0.35) * 100.0
-
-                        # Keep only high niche match
-                        cand_df = cand_df.sort_values("score", ascending=False)
-                        cand_df = cand_df[cand_df["niche_match"] >= max(0.12, float(cand_df["niche_match"].quantile(0.65)))]
-                        cand_df = cand_df.head(max(30, how_many*3))
-
-                        if cand_df.empty:
-                            st.warning("Nothing strongly matched this channel’s niche. Try adding a competitor to tighten the niche profile.")
-                        else:
-                            # Build ideas (agency-grade): keyword control + diversity + guaranteed count
-
-                            def _kw_list(raw: str) -> list[str]:
-                                raw = (raw or "").strip()
-                                if not raw:
-                                    return []
-                                parts = [p.strip() for p in raw.split(",")]
-                                out = []
-                                for p in parts:
-                                    p2 = re.sub(r"[^A-Za-z0-9\s\-']", "", p).strip()
-                                    if len(p2) >= 2:
-                                        out.append(p2)
-                                # de-dup preserve order
-                                seen=set(); uniq=[]
-                                for x in out:
-                                    k=x.lower()
-                                    if k in seen: continue
-                                    seen.add(k); uniq.append(x)
-                                return uniq
-
-                            def _prefix3(t: str) -> str:
-                                w = re.findall(r"[A-Za-z0-9']+", (t or "").lower())
-                                return " ".join(w[:3])
-
-                            def _family(t: str) -> str:
-                                tl = (t or "").lower()
-                                if tl.startswith("how ") or " how " in tl:
-                                    return "how"
-                                if tl.startswith("why "):
-                                    return "why"
-                                if "mistake" in tl:
-                                    return "mistakes"
-                                if "30 day" in tl or "30-day" in tl or "i tried" in tl or "i tested" in tl:
-                                    return "experiment"
-                                if "framework" in tl or "system" in tl or "rules" in tl or "checklist" in tl:
-                                    return "framework"
-                                if "truth" in tl or "nobody tells" in tl:
-                                    return "truth"
-                                return "other"
-
-                            def _strict_evidence(df: pd.DataFrame) -> pd.DataFrame:
-                                d = df.copy()
-                                # pattern mining should only learn from high-confidence niche matches
-                                d = d[d["niche_match"].fillna(0).astype(float) >= 0.75]
-                                return d
-
-                            def _detect_style(channel_input: str, df: pd.DataFrame) -> str:
-                                """Lightweight style detector used ONLY inside Video Ideas.
-                                Returns one of: 'mrbeast', 'generic'. Keeps logic simple and defensive.
-                                """
-                                t = (channel_input or "").lower()
-                                if "mrbeast" in t or "@mrbeast" in t:
-                                    return "mrbeast"
-                                try:
-                                    if df is not None and not df.empty and "channel_title" in df.columns:
-                                        ct = df["channel_title"].fillna("").astype(str).str.lower()
-                                        if len(ct) > 0:
-                                            frac = float((ct.str.contains("mrbeast")).mean())
-                                            if frac >= 0.35:
-                                                return "mrbeast"
-                                except Exception:
-                                    pass
-                                return "generic"
-
-
-                            def _extract_frames(titles: list[str], style: str) -> list[str]:
-                                """Mine lightweight title frames from evidence, returning format strings.
-                                Frames must contain '{TOPIC}' and may contain '{MECH}'.
-                                """
-                                style = (style or "generic").strip().lower()
-                                out: list[str] = []
-
-                                if style == "mrbeast":
-                                    beast = [
-                                        "{{N}} People Compete To Win ${{M}}",
-                                        "Last To Leave {{TOPIC}} Wins ${{M}}",
-                                        "I Gave {{N}} People ${{M}} If They {{TOPIC}}",
-                                        "I Survived {{N}} Days In {{TOPIC}}",
-                                        "I Built {{TOPIC}} And Gave It Away",
-                                        "I Spent ${{M}} To {{TOPIC}}",
-                                        "I Trapped {{N}} People In {{TOPIC}}",
-                                    ]
-                                    mapped2 = []
-                                    for fr in beast:
-                                        fr = fr.replace("{{N}}", "10").replace("{{M}}", "100,000")
-                                        mapped2.append(fr.replace("{{TOPIC}}", "{TOPIC}"))
-                                    return mapped2
-
-                                if not titles:
-                                    return out
-
-                                def _norm(s: str) -> str:
-                                    s = (s or "").strip()
-                                    s = re.sub(r"\s+", " ", s)
-                                    return s
-
-                                for raw in titles[:80]:
-                                    t = _norm(raw)
-                                    tl = t.lower()
-                                    if not t:
-                                        continue
-                                    if "#short" in tl or "official video" in tl or "music video" in tl:
-                                        continue
-
-                                    if tl.startswith("how to "):
-                                        out.append("How To {TOPIC} (Without Burnout)")
-                                        continue
-                                    if tl.startswith("why "):
-                                        out.append("Why {TOPIC} Is Hard (And How To Fix It)")
-                                        continue
-                                    if tl.startswith("the truth") or "truth" in tl:
-                                        out.append("The Truth About {TOPIC}")
-                                        continue
-                                    if "mistake" in tl or "mistakes" in tl:
-                                        out.append("7 Mistakes Killing Your {TOPIC}")
-                                        continue
-                                    if tl.startswith("i tried") or " for 30 days" in tl:
-                                        out.append("I Tried {TOPIC} For 30 Days (Here’s What Happened)")
-                                        continue
-                                    if "system" in tl or "framework" in tl or "playbook" in tl:
-                                        out.append("The {MECH} System For {TOPIC}")
-                                        continue
-                                    if "explained" in tl:
-                                        out.append("{TOPIC} Explained (No Fluff)")
-                                        continue
-                                    if "nobody tells" in tl:
-                                        out.append("What Nobody Tells You About {TOPIC}")
-                                        continue
-
-                                cleaned=[]
-                                seen=set()
-                                for fr in out:
-                                    if "{TOPIC}" not in fr and "{MECH}" not in fr:
-                                        continue
-                                    k = fr.lower()
-                                    if k in seen:
-                                        continue
-                                    seen.add(k)
-                                    cleaned.append(fr)
-                                return cleaned
-
-                            kw_tokens = _kw_list(include_kw)
-
-                            style = _detect_style(chan_in, cand_df)
-
-                            ev_strict = _strict_evidence(cand_df)
-                            ev_for_frames = ev_strict if not ev_strict.empty else cand_df
-
-                            winner_titles = ev_for_frames["title"].fillna("").astype(str).tolist()
-                            frames = _extract_frames(winner_titles, style)
-
-                            mechs = ["Identity", "Systems", "Discipline", "Psychology", "Leverage", "Habits", "Focus", "Execution"]
-
-                            def _seed_pool(df: pd.DataFrame) -> list[str]:
-                                # Prefer user keywords; then top niche terms; then cleaned search seeds.
-                                seeds: list[str] = []
-                                seeds.extend(kw_tokens)
-                                # top_terms are already niche-weighted
-                                tt = top_terms or []
-                                # top_terms may be dict/Series/iterable depending on upstream scoring
-                                if isinstance(tt, dict):
-                                    tt = [k for k, _ in sorted(tt.items(), key=lambda kv: kv[1], reverse=True)]
-                                elif isinstance(tt, pd.Series):
-                                    tt = tt.tolist()
-                                elif not isinstance(tt, list):
-                                    try:
-                                        tt = list(tt)
-                                    except Exception:
-                                        tt = []
-                                for t in (tt or [])[:12]:
-                                    if isinstance(t, str) and len(t.strip()) >= 3:
-                                        seeds.append(t.strip())
-                                if df is not None and not df.empty and "seed" in df.columns:
-                                    for s in df["seed"].fillna("").astype(str).tolist():
-                                        s2 = re.sub(r"[^A-Za-z0-9\s\-']", " ", s).strip()
-                                        s2 = re.sub(r"\s{2,}", " ", s2)
-                                        # avoid junky two-word fragments like 'reveals brutal'
-                                        if len(s2) < 4:
-                                            continue
-                                        if any(x in s2.lower() for x in ["reveals", "brutal", "truth", "clips"]):
-                                            continue
-                                        seeds.append(s2)
-                                # de-dup preserve order
-                                seen=set(); out=[]
-                                for s in seeds:
-                                    k=s.lower()
-                                    if k in seen: continue
-                                    seen.add(k); out.append(s)
-                                return out
-
-                            seed_pool = _seed_pool(ev_for_frames)
-                            if not seed_pool:
-                                seed_pool = ["Wealth", "Success", "Money", "Discipline", "Mindset"]
-
-                            def _render(frame: str, seed: str, mech: str, style: str, kw: str | None) -> str:
-                                # style can later alter tone (mrbeast etc) but default keeps it clean
-                                t = frame
-                                # Prefer keyword if provided
-                                topic = (kw or seed).strip()
-                                t = t.replace("{SEED}", seed).replace("{MECH}", mech).replace("{TOPIC}", topic)
-                                # Clean weird doubles
-                                t = re.sub(r"\s{2,}", " ", t).strip()
-                                return t
-
-                            # Frame bank (non-spinner). Uses TOPIC + MECH and avoids repeating 'reveals/truth' constantly.
-                            base_frames = [
-                                "How {TOPIC} Really Works (The {MECH} Behind It)",
-                                "Why {TOPIC} Keeps Failing (And The {MECH} Fix)",
-                                "3 Mistakes Keeping You Stuck With {TOPIC}",
-                                "I Tried {TOPIC} for 30 Days — Here’s What Changed",
-                                "The {MECH} System For {TOPIC} (Steal This)",
-                                "The Hidden Rule Behind {TOPIC}",
-                                "{TOPIC}: The Simple System That Actually Sticks",
-                                "What Nobody Tells You About {TOPIC}",
-                                "The Fastest Way To Improve {TOPIC} (Without Burnout)",
-                                "How To Build {TOPIC} When Motivation Is Zero",
-                                "The {MECH} Checklist For {TOPIC} (Start Here)",
-                                "{TOPIC} Explained In 10 Minutes (No Fluff)",
-                            ]
-
-                            # Merge mined frames with our bank, then de-dup.
-                            all_frames = []
-                            for fr in (frames or []):
-                                if isinstance(fr, str) and fr.strip():
-                                    all_frames.append(fr.strip())
-                            for fr in base_frames:
-                                all_frames.append(fr)
-                            seen_fr=set(); uniq_frames=[]
-                            for fr in all_frames:
-                                k=fr.lower()
-                                if k in seen_fr: continue
-                                # drop bad generic mined frames
-                                if "what works right now" in k: continue
-                                if "fastest way to get results" in k: continue
-                                seen_fr.add(k); uniq_frames.append(fr)
-                            all_frames = uniq_frames
-
-                            ideas = []
-                            used = set()
-                            prefix_counts = {}
-                            family_counts = {}
-                            per_seed_counts = {}
-                            per_seed_cap = max(2, int(round(how_many * 0.30)))
-
-                            def _accept(title: str) -> bool:
-                                if not title:
-                                    return False
-                                if _is_spam_title(title):
-                                    return False
-                                k = title.lower().strip()
-                                if k in used:
-                                    return False
-                                p = _prefix3(title)
-                                if prefix_counts.get(p, 0) >= 2:
-                                    return False
-                                fam = _family(title)
-                                if family_counts.get(fam, 0) >= 3:
-                                    return False
-                                return True
-
-                            def _record(title: str, seed_txt: str):
-                                used.add(title.lower().strip())
-                                prefix_counts[_prefix3(title)] = prefix_counts.get(_prefix3(title), 0) + 1
-                                fam = _family(title)
-                                family_counts[fam] = family_counts.get(fam, 0) + 1
-                                per_seed_counts[seed_txt] = per_seed_counts.get(seed_txt, 0) + 1
-                                ideas.append(title)
-
-                            # Generation pass 1: strict (must include keyword if provided)
-                            kw_cycle = (kw_tokens or [None])
-                            kw_i = 0
-                            for seed_txt in seed_pool:
-                                if len(ideas) >= how_many:
-                                    break
-                                per_seed_counts.setdefault(seed_txt, 0)
-                                if per_seed_counts[seed_txt] >= per_seed_cap:
-                                    continue
-                                for fr in all_frames:
-                                    if len(ideas) >= how_many:
-                                        break
-                                    mech = mechs[len(ideas) % len(mechs)]
-                                    kw = kw_cycle[kw_i % len(kw_cycle)]
-                                    kw_i += 1
-                                    t = _clean_title_display(_render(fr, seed_txt, mech, style, kw))
-                                    # if user provided keywords, enforce at least one appears in the title
-                                    if kw_tokens:
-                                        if not any(k.lower() in t.lower() for k in kw_tokens):
-                                            continue
-                                    if not _accept(t):
-                                        continue
-                                    _record(t, seed_txt)
-
-                            # Generation pass 2: backfill (allow titles that don't contain kw, but still niche-safe)
-                            if len(ideas) < how_many:
-                                for seed_txt in seed_pool:
-                                    if len(ideas) >= how_many:
-                                        break
-                                    if per_seed_counts.get(seed_txt, 0) >= per_seed_cap:
-                                        continue
-                                    for fr in all_frames:
-                                        if len(ideas) >= how_many:
-                                            break
-                                        mech = mechs[len(ideas) % len(mechs)]
-                                        t = _clean_title_display(_render(fr, seed_txt, mech, style, None))
-                                        if not _accept(t):
-                                            continue
-                                        _record(t, seed_txt)
-
-                            ideas = ideas[:how_many]
-                            ideas_df = pd.DataFrame({"Primary title": ideas})
-
-                            st.markdown("### Your titles")
-                            if ideas_df is None or ideas_df.empty:
-                                st.warning("Not enough high-quality evidence to generate ideas. Try 90 days or add a competitor.")
-                            else:
-                                if output_mode == "Titles only":
-                                    # Cleaner than a table; still copy-friendly
-                                    for i, t in enumerate(ideas_df["Primary title"].tolist()):
-                                        st.markdown(f"**{i+1}.** {t}")
-                                else:
-                                    for i, row in ideas_df.iterrows():
-                                        title_ = str(row.get("Primary title", "")).strip()
-                                        with st.expander(f"{i+1}. {title_}", expanded=False):
-                                            st.markdown(f"**Primary**: {title_}")
-                                            st.markdown("**Hook (10s):** Outcome → tension → promise (one sentence each).")
-                                            st.markdown("**Outline (5 beats):** Promise → Problem → Proof → Steps → Next action.")
-                                            st.markdown("**Thumbnail direction:** 2–4 words, one promise, high contrast, no clutter.")
-
-                            with st.expander("Evidence (what’s winning right now)", expanded=False):
-                                ev = cand_df[["seed","title","channel_title","views","views_per_day","published","duration_s","niche_match","score"]].copy()
-                                ev["published"] = ev["published"].astype(str).str.replace("T", " ").str.replace("Z", "")
-                                ev = ev.sort_values(["score","views_per_day"], ascending=False).head(25)
-                                st.dataframe(ev, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)

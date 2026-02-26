@@ -1,0 +1,22 @@
+{
+  "default": {
+    "brand_name": "YouTube Audit Pro",
+    "logo_url": "",
+    "accent": "#27a6ff",
+    "bg": "#020617",
+    "panel": "#0f172a",
+    "text": "#ffffff",
+    "muted": "#e5e7eb",
+    "radius": 22
+  },
+  "supportly": {
+    "brand_name": "Supportly Audit Suite",
+    "logo_url": "",
+    "accent": "#2D6BFF",
+    "bg": "#070A12",
+    "panel": "#0B1020",
+    "text": "#FFFFFF",
+    "muted": "#A7B0C0",
+    "radius": 22
+  }
+}

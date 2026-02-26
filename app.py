@@ -80,6 +80,7 @@ TOKEN_FILE = os.getenv("GOOGLE_OAUTH_TOKEN_FILE", "token.json")
 LICENSE_FILE = os.getenv("LICENSE_STORE_FILE", "licenses.json")
 OWNER_PASSWORD = (os.getenv("OWNER_PASSWORD") or "").strip()
 OWNER_LICENSE_KEY = (os.getenv("OWNER_LICENSE_KEY") or "").strip()
+OWNER_LICENSE_KEY = OWNER_LICENSE_KEY or "O-SUPPORTLY-OWNER"
 
 
 # ---------------------------------------------------------------------
@@ -548,8 +549,14 @@ def _gen_admin_code() -> str:
 # License store + tree permissions
 # ---------------------------------------------------------------------
 def _lic_load() -> dict:
+    # Streamlit Cloud often starts with an empty filesystem (no licenses.json).
+    # Auto-create the store so activation + admin works immediately.
     if not os.path.exists(LICENSE_FILE):
-        return {}
+        try:
+            with open(LICENSE_FILE, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+        except Exception:
+            return {}
     try:
         with open(LICENSE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)

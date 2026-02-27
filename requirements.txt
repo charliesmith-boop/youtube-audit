@@ -9,3 +9,4 @@ requests
 python-dotenv
 Pillow
 reportlab
+supabase==2.*

@@ -39,6 +39,12 @@ import hashlib
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 import streamlit as st
+try:
+    # Optional dependency. App should still run without Supabase installed.
+    from supabase import create_client  # type: ignore
+except Exception:
+    create_client = None  # type: ignore
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -87,6 +93,164 @@ LICENSE_FILE = os.getenv("LICENSE_STORE_FILE", "licenses.json")
 OWNER_PASSWORD = (os.getenv("OWNER_PASSWORD") or "").strip()
 OWNER_LICENSE_KEY = (os.getenv("OWNER_LICENSE_KEY") or "").strip()
 OWNER_LICENSE_KEY = OWNER_LICENSE_KEY or "O-SUPPORTLY-OWNER"
+# ---------------------------------------------------------------------
+# Supabase license store (optional). If configured, Supabase is the source of truth.
+# IMPORTANT: SUPABASE_URL must be the API URL like https://<project-ref>.supabase.co
+# Not the dashboard URL.
+# ---------------------------------------------------------------------
+def _secret_get(name: str) -> str:
+    # Streamlit secrets are available via st.secrets; fall back to env vars.
+    try:
+        v = st.secrets.get(name)  # type: ignore[attr-defined]
+        if v is not None:
+            return str(v).strip()
+    except Exception:
+        pass
+    return (os.getenv(name) or "").strip()
+
+def _normalize_supabase_url(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    # If someone pasted the dashboard URL, convert it.
+    if "supabase.com/dashboard/project/" in u:
+        try:
+            # .../dashboard/project/<ref>/...
+            ref = u.split("supabase.com/dashboard/project/", 1)[1].split("/", 1)[0]
+            if ref:
+                return f"https://{ref}.supabase.co"
+        except Exception:
+            pass
+    return u
+
+def _get_supabase_client():
+    if create_client is None:
+        return None
+    url = _normalize_supabase_url(_secret_get("SUPABASE_URL"))
+    key = _secret_get("SUPABASE_SERVICE_ROLE_KEY") or _secret_get("SUPABASE_KEY")
+    if not url or not key:
+        return None
+    # Cache per session
+    try:
+        if "_supabase_client" in st.session_state and st.session_state["_supabase_client"]:
+            return st.session_state["_supabase_client"]
+    except Exception:
+        pass
+    try:
+        client = create_client(url, key)  # type: ignore[misc]
+        try:
+            st.session_state["_supabase_client"] = client
+        except Exception:
+            pass
+        return client
+    except Exception:
+        return None
+
+def _sb_resp_data(resp):
+    if resp is None:
+        return None
+    if hasattr(resp, "data"):
+        return resp.data
+    if isinstance(resp, dict):
+        return resp.get("data")
+    return None
+
+def _sb_fetch_licenses() -> dict:
+    client = _get_supabase_client()
+    if client is None:
+        return {}
+    try:
+        resp = client.table("licenses").select("*").execute()
+        rows = _sb_resp_data(resp) or []
+    except Exception:
+        return {}
+
+    store: dict = {}
+    for r in rows or []:
+        try:
+            key = r.get("license_key") or r.get("key")
+            if not key:
+                continue
+            data = r.get("data") or {}
+            lic = data if isinstance(data, dict) else {}
+            # Overlay common columns if present (keeps compatibility with existing app logic)
+            if "status" in r:
+                # Some code uses active True/False; keep both
+                status = str(r.get("status") or "").strip().lower()
+                if status:
+                    lic.setdefault("status", status)
+                    if "active" not in lic:
+                        lic["active"] = (status == "active")
+            if "plan" in r and r.get("plan") is not None:
+                lic.setdefault("plan", r.get("plan"))
+            if "customer" in r and r.get("customer") is not None:
+                lic.setdefault("customer", r.get("customer"))
+            if "notes" in r and r.get("notes") is not None:
+                lic.setdefault("notes", r.get("notes"))
+            if "expires_at" in r and r.get("expires_at") is not None:
+                lic.setdefault("expires_at", r.get("expires_at"))
+            store[str(key)] = lic
+        except Exception:
+            continue
+    return store
+
+def _sb_write_licenses(store: dict) -> bool:
+    client = _get_supabase_client()
+    if client is None:
+        return False
+    try:
+        # Fetch existing keys so we can delete removed ones.
+        resp = client.table("licenses").select("license_key").execute()
+        existing_rows = _sb_resp_data(resp) or []
+        existing = {str(r.get("license_key")) for r in existing_rows if r.get("license_key")}
+    except Exception:
+        existing = set()
+
+    # Upsert all current keys
+    rows = []
+    for k, lic in (store or {}).items():
+        try:
+            licd = lic if isinstance(lic, dict) else {}
+            status = licd.get("status")
+            if status is None:
+                # derive from active if present
+                if "active" in licd:
+                    status = "active" if bool(licd.get("active")) else "inactive"
+            plan = licd.get("plan")
+            customer = licd.get("customer")
+            notes = licd.get("notes")
+            expires_at = licd.get("expires_at")
+            rows.append({
+                "license_key": str(k),
+                "status": (str(status).lower() if status is not None else None),
+                "plan": (str(plan) if plan is not None else None),
+                "customer": (str(customer) if customer is not None else None),
+                "notes": (str(notes) if notes is not None else None),
+                "expires_at": expires_at,
+                "data": licd,
+            })
+        except Exception:
+            continue
+
+    try:
+        if rows:
+            client.table("licenses").upsert(rows).execute()
+    except Exception:
+        return False
+
+    # Delete keys that no longer exist
+    to_delete = list(existing - {str(k) for k in (store or {}).keys()})
+    try:
+        # Supabase has URL size limits; chunk deletes
+        for i in range(0, len(to_delete), 200):
+            chunk = to_delete[i:i+200]
+            if chunk:
+                client.table("licenses").delete().in_("license_key", chunk).execute()
+    except Exception:
+        pass
+
+    return True
+
 # ---------------------------------------------------------------------
 # Branding / UI theming (CUSTOM per tree, no presets)
 # ---------------------------------------------------------------------
@@ -505,8 +669,12 @@ def _gen_admin_code() -> str:
 # License store + tree permissions
 # ---------------------------------------------------------------------
 def _lic_load() -> dict:
-    # Streamlit Cloud often starts with an empty filesystem (no licenses.json).
-    # Auto-create the store so activation + admin works immediately.
+    # Prefer Supabase if configured; fall back to local JSON store.
+    sb = _sb_fetch_licenses()
+    if sb:
+        return sb
+
+    # Streamlit Cloud filesystem is ephemeral; JSON is only a fallback for local dev.
     if not os.path.exists(LICENSE_FILE):
         try:
             with open(LICENSE_FILE, "w", encoding="utf-8") as f:
@@ -519,7 +687,11 @@ def _lic_load() -> dict:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
 def _lic_save(store: dict):
+    # Write to Supabase if possible; otherwise write to local JSON.
+    if _sb_write_licenses(store):
+        return
     tmp = LICENSE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(store, f, indent=2)

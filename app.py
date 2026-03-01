@@ -211,24 +211,29 @@ def _sb_write_licenses(store: dict) -> bool:
     for k, lic in (store or {}).items():
         try:
             licd = lic if isinstance(lic, dict) else {}
+            # Table requires NOT NULL status + plan. Derive sensible defaults.
+            active_flag = licd.get("active")
             status = licd.get("status")
             if status is None:
-                # derive from active if present
-                if "active" in licd:
-                    status = "active" if bool(licd.get("active")) else "inactive"
-            plan = licd.get("plan")
+                if active_flag is None:
+                    status = "active"
+                else:
+                    status = "active" if bool(active_flag) else "inactive"
+            plan = licd.get("plan") or "standard"
             customer = licd.get("customer")
             notes = licd.get("notes")
             expires_at = licd.get("expires_at")
             rows.append({
                 "license_key": str(k),
-                "status": (str(status).lower() if status is not None else None),
-                "plan": (str(plan) if plan is not None else None),
+                "status": str(status).lower(),
+                "plan": str(plan),
                 "customer": (str(customer) if customer is not None else None),
                 "notes": (str(notes) if notes is not None else None),
                 "expires_at": expires_at,
                 "data": licd,
             })
+        except Exception:
+            continue
         except Exception:
             continue
 

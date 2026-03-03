@@ -108,6 +108,245 @@ def _secret_get(name: str) -> str:
         pass
     return (os.getenv(name) or "").strip()
 
+# ---------------------------------------------------------------------
+# Google Sheets license store (recommended). Uses Service Account from Streamlit Secrets.
+# Secrets expected (TOML):
+#   SHEET_ID = "..."
+#   SHEET_NAME = "Sheet1"
+#   [GOOGLE_SERVICE_ACCOUNT]
+#   type="service_account"
+#   project_id="..."
+#   private_key_id="..."
+#   private_key="""-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"""
+#   client_email="..."
+#   client_id="..."
+#   token_uri="https://oauth2.googleapis.com/token"
+#   ...
+# ---------------------------------------------------------------------
+try:
+    from google.oauth2.service_account import Credentials as _SACredentials  # type: ignore
+except Exception:
+    _SACredentials = None  # type: ignore
+
+def _gs_get_cfg() -> tuple[str, str] | None:
+    sheet_id = _secret_get("SHEET_ID")
+    sheet_name = _secret_get("SHEET_NAME") or "Sheet1"
+    if not sheet_id:
+        return None
+    return sheet_id, sheet_name
+
+def _gs_get_service_account_info() -> dict | None:
+    # With TOML table, st.secrets["GOOGLE_SERVICE_ACCOUNT"] comes through as a dict-like.
+    try:
+        info = st.secrets.get("GOOGLE_SERVICE_ACCOUNT")  # type: ignore[attr-defined]
+        if isinstance(info, dict) and info.get("client_email") and info.get("private_key"):
+            return dict(info)
+    except Exception:
+        pass
+    return None
+
+@st.cache_resource(show_spinner=False)
+def _gs_sheets_service():
+    if _SACredentials is None:
+        return None
+    cfg = _gs_get_cfg()
+    info = _gs_get_service_account_info()
+    if not cfg or not info:
+        return None
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    try:
+        creds = _SACredentials.from_service_account_info(info, scopes=scopes)
+        return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    except Exception:
+        return None
+
+def _gs_read_values(sheet_id: str, sheet_name: str) -> list[list[str]] | None:
+    svc = _gs_sheets_service()
+    if svc is None:
+        return None
+    try:
+        rng = f"{sheet_name}!A:Z"
+        resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
+        vals = resp.get("values", [])
+        return vals if isinstance(vals, list) else []
+    except Exception:
+        return None
+
+def _gs_write_values(sheet_id: str, sheet_name: str, values: list[list[str]]) -> bool:
+    svc = _gs_sheets_service()
+    if svc is None:
+        return False
+    try:
+        rng = f"{sheet_name}!A1"
+        body = {"values": values}
+        svc.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=rng,
+            valueInputOption="RAW",
+            body=body,
+        ).execute()
+        return True
+    except Exception:
+        return False
+
+def _gs_fetch_licenses() -> dict | None:
+    cfg = _gs_get_cfg()
+    if not cfg:
+        return None
+    sheet_id, sheet_name = cfg
+    rows = _gs_read_values(sheet_id, sheet_name)
+    if rows is None:
+        return None
+
+    # If sheet is empty, treat as reachable but empty store
+    if not rows:
+        return {}
+
+    header = [h.strip() for h in (rows[0] or [])]
+    # Minimum required header
+    if not header or header[0].lower() != "license_key":
+        # Not in expected shape; treat as failure so we don't overwrite unknown sheet
+        return None
+
+    # Ensure we can parse a "data" json column if present
+    col_idx = {h: i for i, h in enumerate(header)}
+    data_i = col_idx.get("data")
+
+    store: dict[str, dict] = {}
+    for r in rows[1:]:
+        if not r:
+            continue
+        try:
+            k = (r[col_idx["license_key"]] if col_idx.get("license_key") is not None and len(r) > col_idx["license_key"] else "").strip()
+        except Exception:
+            k = ""
+        if not k:
+            continue
+
+        lic: dict = {}
+        # Prefer full json payload if present
+        if data_i is not None and len(r) > data_i and (r[data_i] or "").strip():
+            try:
+                lic = json.loads(r[data_i])
+                if not isinstance(lic, dict):
+                    lic = {}
+            except Exception:
+                lic = {}
+
+        # Overlay commonly used columns (keeps compatibility with existing logic)
+        def _col(name: str):
+            i = col_idx.get(name)
+            if i is None or i >= len(r):
+                return None
+            v = r[i]
+            return v
+
+        role = _col("role")
+        active = _col("active")
+        white_label = _col("white_label")
+        parent = _col("parent")
+        created_by = _col("created_by")
+        admin_hash = _col("admin_hash")
+        brand = _col("brand")
+        created_utc = _col("created_utc")
+        updated_utc = _col("updated_utc")
+
+        if role is not None and str(role).strip() != "":
+            lic.setdefault("role", str(role).strip())
+        if active is not None and str(active).strip() != "":
+            lic.setdefault("active", str(active).strip().lower() in {"1","true","yes","y","active"})
+        if white_label is not None and str(white_label).strip() != "":
+            lic.setdefault("white_label", str(white_label).strip().lower() in {"1","true","yes","y"})
+        if parent is not None and str(parent).strip() != "":
+            lic.setdefault("parent", str(parent).strip())
+        if created_by is not None and str(created_by).strip() != "":
+            lic.setdefault("created_by", str(created_by).strip())
+        if admin_hash is not None and str(admin_hash).strip() != "":
+            lic.setdefault("admin_hash", str(admin_hash).strip())
+        if brand is not None and str(brand).strip() != "":
+            # brand column may be JSON string
+            try:
+                b = json.loads(brand)
+                if isinstance(b, dict):
+                    lic.setdefault("brand", b)
+            except Exception:
+                pass
+        if created_utc is not None and str(created_utc).strip() != "":
+            lic.setdefault("created_utc", str(created_utc).strip())
+        if updated_utc is not None and str(updated_utc).strip() != "":
+            lic.setdefault("updated_utc", str(updated_utc).strip())
+
+        store[str(k)] = lic
+
+    return store
+
+def _gs_write_licenses(store: dict) -> bool:
+    cfg = _gs_get_cfg()
+    if not cfg:
+        return False
+    sheet_id, sheet_name = cfg
+    existing = _gs_read_values(sheet_id, sheet_name)
+    if existing is None:
+        return False
+
+    # Define canonical header (we will preserve any extra headers by appending ours if missing)
+    base_header = [
+        "license_key","role","active","white_label","parent","created_by","admin_hash","brand","created_utc","updated_utc","data"
+    ]
+
+    header = [h.strip() for h in (existing[0] if existing else [])]
+    if not header or (header and header[0].lower() != "license_key"):
+        header = base_header
+    else:
+        # ensure required columns exist
+        for h in base_header:
+            if h not in header:
+                header.append(h)
+
+    col_idx = {h: i for i, h in enumerate(header)}
+
+    def _bool_str(v: bool) -> str:
+        return "TRUE" if bool(v) else "FALSE"
+
+    out_rows: list[list[str]] = [header]
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for k, lic in sorted((store or {}).items(), key=lambda kv: str(kv[0])):
+        if not isinstance(lic, dict):
+            continue
+        role = str(lic.get("role") or "client").strip().lower()
+        active = bool(lic.get("active", False))
+        white_label = bool(lic.get("white_label", False))
+        parent = str(lic.get("parent") or "").strip()
+        created_by = str(lic.get("created_by") or "").strip()
+        admin_hash = str(lic.get("admin_hash") or "").strip()
+        brand_obj = lic.get("brand") if isinstance(lic.get("brand"), dict) else None
+        brand_json = json.dumps(brand_obj) if brand_obj is not None else ""
+        created_utc = str(lic.get("created_utc") or "").strip() or now_iso
+        updated_utc = str(lic.get("updated_utc") or "").strip() or now_iso
+        data_json = json.dumps(lic, separators=(",", ":"), ensure_ascii=False)
+
+        row = [""] * len(header)
+        row[col_idx["license_key"]] = str(k)
+        row[col_idx["role"]] = role
+        row[col_idx["active"]] = _bool_str(active)
+        row[col_idx["white_label"]] = _bool_str(white_label)
+        row[col_idx["parent"]] = parent
+        row[col_idx["created_by"]] = created_by
+        row[col_idx["admin_hash"]] = admin_hash
+        row[col_idx["brand"]] = brand_json
+        row[col_idx["created_utc"]] = created_utc
+        row[col_idx["updated_utc"]] = updated_utc
+        row[col_idx["data"]] = data_json
+
+        out_rows.append(row)
+
+    return _gs_write_values(sheet_id, sheet_name, out_rows)
+
+
 def _normalize_supabase_url(url: str) -> str:
     u = (url or "").strip()
     if not u:
@@ -674,7 +913,16 @@ def _gen_admin_code() -> str:
 # License store + tree permissions
 # ---------------------------------------------------------------------
 def _lic_load() -> dict:
-    # Prefer Supabase if configured; fall back to local JSON store.
+    """
+    Source of truth order:
+    1) Google Sheets (service account) if configured (SHEET_ID + GOOGLE_SERVICE_ACCOUNT)
+    2) Supabase (optional) if configured
+    3) Local JSON (local dev fallback only)
+    """
+    gs = _gs_fetch_licenses()
+    if gs is not None:
+        return gs
+
     sb = _sb_fetch_licenses()
     if sb:
         return sb
@@ -694,9 +942,16 @@ def _lic_load() -> dict:
         return {}
 
 def _lic_save(store: dict):
-    # Write to Supabase if possible; otherwise write to local JSON.
+    # Write to Google Sheets if possible; otherwise fall back.
+    try:
+        if _gs_write_licenses(store):
+            return
+    except Exception:
+        pass
+
     if _sb_write_licenses(store):
         return
+
     tmp = LICENSE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(store, f, indent=2)

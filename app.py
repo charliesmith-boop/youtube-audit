@@ -758,59 +758,39 @@ def _gs_col_to_a1(col: int) -> str:
 
 
 def _lic_load() -> dict:
-    # Primary: Google Sheets (source of truth on Streamlit Cloud)
-    gs = _gs_fetch_licenses()
-    if gs:
-        return gs
-
-    # Last resort: local JSON (ONLY reliable for local dev)
-    if not os.path.exists(LICENSE_FILE):
-        try:
-            with open(LICENSE_FILE, "w", encoding="utf-8") as f:
-                json.dump({}, f)
-        except Exception:
-            return {}
+    """Load licenses from Google Sheets (single source of truth)."""
+    if not _gs_available():
+        st.error("License store unavailable (Google Sheets not configured).")
+        return {}
     try:
-        with open(LICENSE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
+        return _gs_fetch_licenses() or {}
+    except Exception as e:
+        st.error(f"License store read failed: {e}")
         return {}
 
 
 def _lic_upsert_one(license_key: str, lic: dict) -> bool:
-    """
-    Writes exactly ONE license (append/update) to the primary store.
-    """
-    if _gs_upsert_license(license_key, lic):
-        return True
-
-    # local fallback
-    store = _lic_load()
-    store[str(license_key)] = lic if isinstance(lic, dict) else {}
-    _lic_save_local(store)
+    """Upsert exactly ONE license row in Google Sheets. Never rewrites the sheet."""
+    if not _gs_available():
+        st.error("License write failed: Google Sheets not configured.")
+        st.stop()
+    ok = _gs_upsert_license(license_key, lic)
+    if not ok:
+        st.error("License write failed: could not save to Google Sheets. No changes were applied.")
+        st.stop()
     return True
 
 
 def _lic_delete_one(license_key: str) -> bool:
-    """
-    Deletes exactly ONE license from the primary store.
-    """
-    if _gs_delete_license(license_key):
-        return True
-
-    # local fallback
-    store = _lic_load()
-    store.pop(str(license_key), None)
-    _lic_save_local(store)
+    """Delete exactly ONE license row in Google Sheets. Never rewrites the sheet."""
+    if not _gs_available():
+        st.error("License delete failed: Google Sheets not configured.")
+        st.stop()
+    ok = _gs_delete_license(license_key)
+    if not ok:
+        st.error("License delete failed: could not delete from Google Sheets. No changes were applied.")
+        st.stop()
     return True
-
-
-def _lic_save_local(store: dict):
-    tmp = LICENSE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(store, f, indent=2)
-    os.replace(tmp, LICENSE_FILE)
 
 
 def _lic_is_active(lic: dict | None) -> bool:

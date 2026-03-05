@@ -1318,6 +1318,9 @@ def _render_owner_panel():
     )
     cur_brand = lic.get("brand") if isinstance(lic.get("brand"), dict) else _default_brand()
     brand_payload = _brand_editor_ui("owner", cur_brand)
+    apply_to_subtree = False
+    if _lic_role(lic) in {'reseller','owner'} and bool(white_label):
+        apply_to_subtree = st.sidebar.toggle("Apply branding to this license's subtree", value=False, key="owner_apply_tree")
     if st.sidebar.button("Save license"):
         store = _lic_load()
         lic2 = store.get(target, {})
@@ -1330,17 +1333,20 @@ def _render_owner_panel():
         lic2["brand"] = brand_payload if bool(white_label) else lic2.get("brand", None)
         lic2["updated_utc"] = datetime.now(timezone.utc).isoformat()
         store[target] = lic2
-                # Persist only the rows that changed (no full-sheet rewrite)
+        # Persist only the row that changed (no full-sheet rewrite)
         _lic_upsert_one(target, store[target])
-        if apply_to_subtree and target == me:
-            sub = _subtree_keys(store, me)
+        if apply_to_subtree:
+            sub = _subtree_keys(store, target)
             for k in sub:
-                if k == me:
+                if k == target:
                     continue
                 v = store.get(k)
                 if not isinstance(v, dict):
                     continue
-                if bool(v.get("white_label", False)):
+                if bool(v.get('white_label', False)):
+                    v['brand'] = brand_payload
+                    v['updated_utc'] = datetime.now(timezone.utc).isoformat()
+                    store[k] = v
                     _lic_upsert_one(k, v)
         st.sidebar.success("Saved.")
         st.rerun()

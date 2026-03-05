@@ -9,4 +9,5 @@ requests
 python-dotenv
 Pillow
 reportlab
-supabase==2.*
+gspread
+google-auth

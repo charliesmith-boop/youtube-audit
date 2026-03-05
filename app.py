@@ -714,6 +714,15 @@ def _gs_write_licenses(store: dict) -> bool:
         return False
 
 
+
+# --- Supabase optional stubs (kept for backwards compatibility) ---
+# If you later re-enable Supabase, replace these with real implementations.
+def _sb_fetch_licenses() -> dict:
+    return {}
+
+def _sb_write_licenses(store: dict) -> bool:
+    return False
+
 def _lic_load() -> dict:
     # Primary: Google Sheets (durable on Streamlit Cloud)
     gs = _gs_fetch_licenses()

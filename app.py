@@ -49,11 +49,6 @@ from reportlab.lib.pagesizes import A4
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request, AuthorizedSession
-# Optional Supabase client (keeps app runnable even if supabase package is not installed)
-try:
-    from supabase import create_client  # type: ignore
-except Exception:
-    create_client = None  # type: ignore
 # ---------------------------------------------------------------------
 # Bootstrap / config
 # ---------------------------------------------------------------------
@@ -69,8 +64,6 @@ SCOPES = [
 ]
 CLIENT_FILE = os.getenv("GOOGLE_CLIENT_SECRET_FILE", "client_secret.json")
 TOKEN_FILE = os.getenv("GOOGLE_OAUTH_TOKEN_FILE", "token.json")
-SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
-SUPABASE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY") or "").strip()
 # --- Streamlit Cloud OAuth bootstrap (no local browser) ---
 # Store your client_secret.json and token.json in Streamlit Secrets as:
 #   GOOGLE_CLIENT_SECRET_JSON = """{...}"""
@@ -511,21 +504,8 @@ def _gen_admin_code() -> str:
 # ---------------------------------------------------------------------
 # License store + tree permissions
 # ---------------------------------------------------------------------
-def _supabase_client():
-    """Create a Supabase client if configured; otherwise return None."""
-    if not SUPABASE_URL or not SUPABASE_KEY or create_client is None:
-        return None
-    try:
-        return create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception:
-        return None
-
-# Cache resolved key column name for the licenses table ("key" or "license_key")
-_LIC_KEY_COL: str | None = None
-
 def _gs_available() -> bool:
     try:
-        import streamlit as st  # type: ignore
         _ = st.secrets.get("SHEET_ID")
         __ = st.secrets.get("SHEET_NAME")
         ___ = st.secrets.get("GOOGLE_SERVICE_ACCOUNT")
@@ -535,7 +515,6 @@ def _gs_available() -> bool:
 
 
 def _gs_open_worksheet():
-    import streamlit as st  # type: ignore
     import gspread  # type: ignore
     from google.oauth2.service_account import Credentials  # type: ignore
 
@@ -551,8 +530,8 @@ def _gs_open_worksheet():
     return ws
 
 
-def _gs_headers() -> list[str]:
-    # Keep these aligned with your current sheet.
+def _gs_required_headers() -> list[str]:
+    # Must match your sheet (source of truth)
     return [
         "license_key",
         "role",
@@ -564,28 +543,101 @@ def _gs_headers() -> list[str]:
         "brand",
         "created_utc",
         "updated_utc",
-        "data",
     ]
 
 
-def _gs_ensure_schema(ws) -> list[str]:
-    # Ensure header row exists and contains required columns (adds missing ones).
-    headers = _gs_headers()
-    try:
-        first_row = ws.row_values(1)
-    except Exception:
-        first_row = []
-    if not first_row:
-        ws.update("A1", [headers])
-        return headers
+def _gs_ensure_schema(ws) -> dict[str, int]:
+    """
+    Ensures required headers exist (adds missing headers to the right).
+    Returns a header->col_index (1-based) map.
+    NEVER clears/re-writes the sheet.
+    """
+    required = _gs_required_headers()
 
-    # Normalize existing headers and extend if missing.
-    existing = [h.strip() for h in first_row if h is not None]
-    missing = [h for h in headers if h not in existing]
+    try:
+        header_row = ws.row_values(1)
+    except Exception:
+        header_row = []
+
+    header_row = [str(h).strip() for h in (header_row or []) if str(h).strip()]
+
+    if not header_row:
+        ws.update("A1", [required])
+        return {h: i + 1 for i, h in enumerate(required)}
+
+    existing_set = set(header_row)
+    missing = [h for h in required if h not in existing_set]
     if missing:
-        ws.update("A1", [existing + missing])
-        return existing + missing
-    return existing
+        ws.update("A1", [header_row + missing])
+        header_row = header_row + missing
+
+    return {h: (header_row.index(h) + 1) for h in required}
+
+
+def _gs_bool_to_cell(v: object) -> str:
+    return "TRUE" if bool(v) else "FALSE"
+
+
+def _gs_parse_bool(v: object) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v).strip().lower()
+    return s in {"true", "1", "yes", "y", "t"}
+
+
+def _gs_find_row(ws, hk: dict[str, int], license_key: str) -> int | None:
+    key = (license_key or "").strip()
+    if not key:
+        return None
+    col = hk["license_key"]
+    try:
+        col_vals = ws.col_values(col)  # includes header at index 0
+    except Exception:
+        return None
+    # rows are 1-based; row 1 is header
+    for i, val in enumerate(col_vals[1:], start=2):
+        if str(val).strip() == key:
+            return i
+    return None
+
+
+def _gs_license_to_row(hk: dict[str, int], license_key: str, lic: dict, existing_created_utc: str | None) -> dict[str, str]:
+    now = datetime.now(timezone.utc).isoformat()
+    role = str((lic or {}).get("role") or "client").strip().lower()
+    role = role if role in {"owner", "reseller", "client"} else "client"
+
+    active = _gs_bool_to_cell((lic or {}).get("active", False))
+    wl = _gs_bool_to_cell((lic or {}).get("white_label", False))
+
+    parent = (lic or {}).get("parent") or ""
+    created_by = (lic or {}).get("created_by") or ""
+    admin_hash = (lic or {}).get("admin_hash") or ""
+
+    brand = (lic or {}).get("brand")
+    if isinstance(brand, (dict, list)):
+        brand_cell = json.dumps(brand, ensure_ascii=False)
+    else:
+        brand_cell = str(brand or "")
+
+    created_utc = str((lic or {}).get("created_utc") or existing_created_utc or now)
+    updated_utc = now
+
+    return {
+        "license_key": str(license_key),
+        "role": role,
+        "active": active,
+        "white_label": wl,
+        "parent": str(parent or ""),
+        "created_by": str(created_by or ""),
+        "admin_hash": str(admin_hash or ""),
+        "brand": brand_cell,
+        "created_utc": created_utc,
+        "updated_utc": updated_utc,
+    }
 
 
 def _gs_fetch_licenses() -> dict:
@@ -593,37 +645,23 @@ def _gs_fetch_licenses() -> dict:
         return {}
     try:
         ws = _gs_open_worksheet()
-        headers = _gs_ensure_schema(ws)
-        records = ws.get_all_records(expected_headers=headers)
+        hk = _gs_ensure_schema(ws)
+        records = ws.get_all_records(expected_headers=list(hk.keys()))
         out: dict[str, dict] = {}
         for r in records:
             k = str(r.get("license_key") or "").strip()
             if not k:
                 continue
-
-            # Parse booleans
-            active = r.get("active")
-            if isinstance(active, str):
-                active = active.strip().lower() in {"true", "1", "yes", "y"}
-            active = bool(active)
-
-            wl = r.get("white_label")
-            if isinstance(wl, str):
-                wl = wl.strip().lower() in {"true", "1", "yes", "y"}
-            wl = bool(wl) if wl is not None else False
-
-            lic = {
-                "role": (r.get("role") or "client"),
-                "active": active,
-                "white_label": wl,
-                "parent": (r.get("parent") or None) or None,
-                "created_by": (r.get("created_by") or None) or None,
-                "admin_hash": (r.get("admin_hash") or None) or None,
-                "created_utc": (r.get("created_utc") or None) or None,
-                "updated_utc": (r.get("updated_utc") or None) or None,
+            lic: dict = {
+                "role": str(r.get("role") or "client").strip().lower(),
+                "active": _gs_parse_bool(r.get("active")),
+                "white_label": _gs_parse_bool(r.get("white_label")),
+                "parent": (str(r.get("parent") or "").strip() or None),
+                "created_by": (str(r.get("created_by") or "").strip() or None),
+                "admin_hash": (str(r.get("admin_hash") or "").strip() or None),
+                "created_utc": (str(r.get("created_utc") or "").strip() or None),
+                "updated_utc": (str(r.get("updated_utc") or "").strip() or None),
             }
-
-            # brand may be JSON
             brand_raw = r.get("brand")
             if isinstance(brand_raw, str) and brand_raw.strip():
                 try:
@@ -632,17 +670,6 @@ def _gs_fetch_licenses() -> dict:
                     lic["brand"] = brand_raw
             elif brand_raw:
                 lic["brand"] = brand_raw
-
-            # data column stores full payload (JSON)
-            data_raw = r.get("data")
-            if isinstance(data_raw, str) and data_raw.strip():
-                try:
-                    extra = json.loads(data_raw)
-                    if isinstance(extra, dict):
-                        lic.update(extra)
-                except Exception:
-                    pass
-
             out[k] = lic
         return out
     except Exception as e:
@@ -653,86 +680,88 @@ def _gs_fetch_licenses() -> dict:
         return {}
 
 
-def _gs_write_licenses(store: dict) -> bool:
+def _gs_get_created_utc(ws, hk: dict[str, int], row: int) -> str | None:
+    try:
+        val = ws.cell(row, hk["created_utc"]).value
+        return str(val).strip() if val else None
+    except Exception:
+        return None
+
+
+def _gs_upsert_license(license_key: str, lic: dict) -> bool:
+    """
+    Upsert exactly ONE license row (append or update).
+    NEVER clears/re-writes the sheet.
+    """
     if not _gs_available():
         return False
     try:
         ws = _gs_open_worksheet()
-        headers = _gs_ensure_schema(ws)
+        hk = _gs_ensure_schema(ws)
+        row = _gs_find_row(ws, hk, license_key)
+        existing_created_utc = _gs_get_created_utc(ws, hk, row) if row else None
+        row_map = _gs_license_to_row(hk, license_key, lic, existing_created_utc)
 
-        # rewrite entire sheet (simple + consistent)
-        rows = []
-        now = datetime.now(timezone.utc).isoformat()
+        if row is None:
+            # Append row in required header order
+            values = [row_map[h] for h in _gs_required_headers()]
+            ws.append_row(values, value_input_option="RAW")
+            return True
 
-        def _as_json(v) -> str:
-            try:
-                return json.dumps(v, ensure_ascii=False)
-            except Exception:
-                return ""
-
-        for k, v in (store or {}).items():
-            if not isinstance(v, dict):
-                continue
-            role = v.get("role") or "client"
-            active = bool(v.get("active", False))
-            wl = bool(v.get("white_label", False))
-            parent = v.get("parent") or ""
-            created_by = v.get("created_by") or ""
-            admin_hash = v.get("admin_hash") or ""
-            brand = v.get("brand")
-            created_utc = v.get("created_utc") or now
-            updated_utc = now
-
-            # Store full dict in data column to preserve everything.
-            data_json = _as_json(v)
-
-            row_map = {
-                "license_key": k,
-                "role": role,
-                "active": "TRUE" if active else "FALSE",
-                "white_label": "TRUE" if wl else "FALSE",
-                "parent": parent,
-                "created_by": created_by,
-                "admin_hash": admin_hash,
-                "brand": _as_json(brand) if isinstance(brand, (dict, list)) else (brand or ""),
-                "created_utc": created_utc,
-                "updated_utc": updated_utc,
-                "data": data_json,
-            }
-            rows.append([row_map.get(h, "") for h in headers])
-
-        ws.clear()
-        ws.update("A1", [headers])
-        if rows:
-            ws.append_rows(rows, value_input_option="RAW")
+        # Update only specific cells (one batch call)
+        updates = []
+        for h in _gs_required_headers():
+            col = hk[h]
+            a1 = f"{_gs_col_to_a1(col)}{row}"
+            updates.append({"range": a1, "values": [[row_map[h]]]})
+        ws.batch_update(updates)
         return True
     except Exception as e:
         try:
-            print(f"[licenses] Google Sheets write failed: {e}")
+            print(f"[licenses] Google Sheets upsert failed: {e}")
         except Exception:
             pass
         return False
 
 
+def _gs_delete_license(license_key: str) -> bool:
+    """
+    Delete exactly ONE license row (by license_key).
+    NEVER clears/re-writes the sheet.
+    """
+    if not _gs_available():
+        return False
+    try:
+        ws = _gs_open_worksheet()
+        hk = _gs_ensure_schema(ws)
+        row = _gs_find_row(ws, hk, license_key)
+        if row is None:
+            return True
+        ws.delete_rows(row)
+        return True
+    except Exception as e:
+        try:
+            print(f"[licenses] Google Sheets delete failed: {e}")
+        except Exception:
+            pass
+        return False
 
-# --- Supabase optional stubs (kept for backwards compatibility) ---
-# If you later re-enable Supabase, replace these with real implementations.
-def _sb_fetch_licenses() -> dict:
-    return {}
 
-def _sb_write_licenses(store: dict) -> bool:
-    return False
+def _gs_col_to_a1(col: int) -> str:
+    # 1 -> A, 2 -> B, ... 27 -> AA
+    n = int(col)
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
 
 def _lic_load() -> dict:
-    # Primary: Google Sheets (durable on Streamlit Cloud)
+    # Primary: Google Sheets (source of truth on Streamlit Cloud)
     gs = _gs_fetch_licenses()
     if gs:
         return gs
-
-    # Secondary: Supabase if configured (optional)
-    sb = _sb_fetch_licenses()
-    if sb:
-        return sb
 
     # Last resort: local JSON (ONLY reliable for local dev)
     if not os.path.exists(LICENSE_FILE):
@@ -749,20 +778,41 @@ def _lic_load() -> dict:
         return {}
 
 
-def _lic_save(store: dict):
-    # Primary: Google Sheets
-    if _gs_write_licenses(store):
-        return
+def _lic_upsert_one(license_key: str, lic: dict) -> bool:
+    """
+    Writes exactly ONE license (append/update) to the primary store.
+    """
+    if _gs_upsert_license(license_key, lic):
+        return True
 
-    # Secondary: Supabase
-    if _sb_write_licenses(store):
-        return
+    # local fallback
+    store = _lic_load()
+    store[str(license_key)] = lic if isinstance(lic, dict) else {}
+    _lic_save_local(store)
+    return True
 
-    # Last resort: local JSON
+
+def _lic_delete_one(license_key: str) -> bool:
+    """
+    Deletes exactly ONE license from the primary store.
+    """
+    if _gs_delete_license(license_key):
+        return True
+
+    # local fallback
+    store = _lic_load()
+    store.pop(str(license_key), None)
+    _lic_save_local(store)
+    return True
+
+
+def _lic_save_local(store: dict):
     tmp = LICENSE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(store, f, indent=2)
     os.replace(tmp, LICENSE_FILE)
+
+
 def _lic_is_active(lic: dict | None) -> bool:
     return bool(lic and isinstance(lic, dict) and lic.get("active", False))
 def _lic_role(lic: dict | None) -> str:
@@ -774,7 +824,7 @@ def _ensure_owner_seed():
         return
     s = _lic_load()
     if OWNER_LICENSE_KEY not in s:
-        s[OWNER_LICENSE_KEY] = {
+        lic = {
             "role": "owner",
             "active": True,
             "white_label": True,
@@ -783,7 +833,7 @@ def _ensure_owner_seed():
             "created_by": None,
             "created_utc": datetime.now(timezone.utc).isoformat(),
         }
-        _lic_save(s)
+        _lic_upsert_one(OWNER_LICENSE_KEY, lic)
 def _subtree_keys(store: dict, root_key: str) -> set[str]:
     root_key = (root_key or "").strip()
     kids_map: dict[str, list[str]] = {}
@@ -1094,7 +1144,7 @@ def _render_reseller_panel():
             st.sidebar.error("Permission denied.")
             return
         new_key, admin_plain = _create_client_license(store, me, active=active_default)
-        _lic_save(store)
+        _lic_upsert_one(new_key, store[new_key])
         st.sidebar.success("Client license created.")
         st.sidebar.code(f"LICENSE: {new_key}\nADMIN CODE: {admin_plain}")
     st.sidebar.markdown("### Your tree")
@@ -1183,7 +1233,18 @@ def _render_reseller_panel():
                     v["brand"] = brand_payload
                     v["updated_utc"] = datetime.now(timezone.utc).isoformat()
                     store[k] = v
-        _lic_save(store)
+                # Persist only the rows that changed (no full-sheet rewrite)
+        _lic_upsert_one(target, store[target])
+        if apply_to_subtree and target == me:
+            sub = _subtree_keys(store, me)
+            for k in sub:
+                if k == me:
+                    continue
+                v = store.get(k)
+                if not isinstance(v, dict):
+                    continue
+                if bool(v.get("white_label", False)):
+                    _lic_upsert_one(k, v)
         st.sidebar.success("Saved.")
         st.rerun()
     if st.sidebar.button("Reset admin code (shows once)"):
@@ -1196,7 +1257,7 @@ def _render_reseller_panel():
             st.sidebar.error("Not allowed.")
             return
         new_code = _reset_admin_code(store, target)
-        _lic_save(store)
+        _lic_upsert_one(target, store[target])
         st.sidebar.warning("Admin code reset. Copy it now:")
         st.sidebar.code(new_code)
     if st.sidebar.button("Delete license"):
@@ -1204,8 +1265,7 @@ def _render_reseller_panel():
         if not _can_delete(me, target, store):
             st.sidebar.error("Not allowed.")
             return
-        del store[target]
-        _lic_save(store)
+        _lic_delete_one(target)
         st.sidebar.success("Deleted.")
         st.rerun()
 def _render_owner_panel():
@@ -1216,7 +1276,7 @@ def _render_owner_panel():
     if st.sidebar.button("Generate reseller account"):
         store = _lic_load()
         new_key, admin_plain = _create_reseller_license(store, active=reseller_active)
-        _lic_save(store)
+        _lic_upsert_one(new_key, store[new_key])
         st.sidebar.success("Reseller created.")
         st.sidebar.code(f"RESELLER LICENSE: {new_key}\nADMIN CODE: {admin_plain}")
     st.sidebar.markdown("---")
@@ -1270,13 +1330,24 @@ def _render_owner_panel():
         lic2["brand"] = brand_payload if bool(white_label) else lic2.get("brand", None)
         lic2["updated_utc"] = datetime.now(timezone.utc).isoformat()
         store[target] = lic2
-        _lic_save(store)
+                # Persist only the rows that changed (no full-sheet rewrite)
+        _lic_upsert_one(target, store[target])
+        if apply_to_subtree and target == me:
+            sub = _subtree_keys(store, me)
+            for k in sub:
+                if k == me:
+                    continue
+                v = store.get(k)
+                if not isinstance(v, dict):
+                    continue
+                if bool(v.get("white_label", False)):
+                    _lic_upsert_one(k, v)
         st.sidebar.success("Saved.")
         st.rerun()
     if st.sidebar.button("Reset admin code (shows once)"):
         store = _lic_load()
         new_code = _reset_admin_code(store, target)
-        _lic_save(store)
+        _lic_upsert_one(target, store[target])
         st.sidebar.warning("Admin code reset. Copy it now:")
         st.sidebar.code(new_code)
     if st.sidebar.button("Delete license (owner)"):
@@ -1284,8 +1355,7 @@ def _render_owner_panel():
             st.sidebar.error("Owner license key is protected.")
         else:
             store = _lic_load()
-            del store[target]
-            _lic_save(store)
+            _lic_delete_one(target)
             st.sidebar.success("Deleted.")
             st.rerun()
 if st.session_state.get("owner_mode", False):

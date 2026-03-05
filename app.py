@@ -39,12 +39,6 @@ import hashlib
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 import streamlit as st
-try:
-    # Optional dependency. App should still run without Supabase installed.
-    from supabase import create_client  # type: ignore
-except Exception:
-    create_client = None  # type: ignore
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -55,6 +49,11 @@ from reportlab.lib.pagesizes import A4
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request, AuthorizedSession
+# Optional Supabase client (keeps app runnable even if supabase package is not installed)
+try:
+    from supabase import create_client  # type: ignore
+except Exception:
+    create_client = None  # type: ignore
 # ---------------------------------------------------------------------
 # Bootstrap / config
 # ---------------------------------------------------------------------
@@ -70,6 +69,8 @@ SCOPES = [
 ]
 CLIENT_FILE = os.getenv("GOOGLE_CLIENT_SECRET_FILE", "client_secret.json")
 TOKEN_FILE = os.getenv("GOOGLE_OAUTH_TOKEN_FILE", "token.json")
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
+SUPABASE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY") or "").strip()
 # --- Streamlit Cloud OAuth bootstrap (no local browser) ---
 # Store your client_secret.json and token.json in Streamlit Secrets as:
 #   GOOGLE_CLIENT_SECRET_JSON = """{...}"""
@@ -93,408 +94,6 @@ LICENSE_FILE = os.getenv("LICENSE_STORE_FILE", "licenses.json")
 OWNER_PASSWORD = (os.getenv("OWNER_PASSWORD") or "").strip()
 OWNER_LICENSE_KEY = (os.getenv("OWNER_LICENSE_KEY") or "").strip()
 OWNER_LICENSE_KEY = OWNER_LICENSE_KEY or "O-SUPPORTLY-OWNER"
-# ---------------------------------------------------------------------
-# Supabase license store (optional). If configured, Supabase is the source of truth.
-# IMPORTANT: SUPABASE_URL must be the API URL like https://<project-ref>.supabase.co
-# Not the dashboard URL.
-# ---------------------------------------------------------------------
-def _secret_get(name: str) -> str:
-    # Streamlit secrets are available via st.secrets; fall back to env vars.
-    try:
-        v = st.secrets.get(name)  # type: ignore[attr-defined]
-        if v is not None:
-            return str(v).strip()
-    except Exception:
-        pass
-    return (os.getenv(name) or "").strip()
-
-# ---------------------------------------------------------------------
-# Google Sheets license store (recommended). Uses Service Account from Streamlit Secrets.
-# Secrets expected (TOML):
-#   SHEET_ID = "..."
-#   SHEET_NAME = "Sheet1"
-#   [GOOGLE_SERVICE_ACCOUNT]
-#   type="service_account"
-#   project_id="..."
-#   private_key_id="..."
-#   private_key="""-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"""
-#   client_email="..."
-#   client_id="..."
-#   token_uri="https://oauth2.googleapis.com/token"
-#   ...
-# ---------------------------------------------------------------------
-try:
-    from google.oauth2.service_account import Credentials as _SACredentials  # type: ignore
-except Exception:
-    _SACredentials = None  # type: ignore
-
-def _gs_get_cfg() -> tuple[str, str] | None:
-    sheet_id = _secret_get("SHEET_ID")
-    sheet_name = _secret_get("SHEET_NAME") or "Sheet1"
-    if not sheet_id:
-        return None
-    return sheet_id, sheet_name
-
-def _gs_get_service_account_info() -> dict | None:
-    # With TOML table, st.secrets["GOOGLE_SERVICE_ACCOUNT"] comes through as a dict-like.
-    try:
-        info = st.secrets.get("GOOGLE_SERVICE_ACCOUNT")  # type: ignore[attr-defined]
-        if isinstance(info, dict) and info.get("client_email") and info.get("private_key"):
-            return dict(info)
-    except Exception:
-        pass
-    return None
-
-@st.cache_resource(show_spinner=False)
-def _gs_sheets_service():
-    if _SACredentials is None:
-        return None
-    cfg = _gs_get_cfg()
-    info = _gs_get_service_account_info()
-    if not cfg or not info:
-        return None
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    try:
-        creds = _SACredentials.from_service_account_info(info, scopes=scopes)
-        return build("sheets", "v4", credentials=creds, cache_discovery=False)
-    except Exception:
-        return None
-
-def _gs_read_values(sheet_id: str, sheet_name: str) -> list[list[str]] | None:
-    svc = _gs_sheets_service()
-    if svc is None:
-        return None
-    try:
-        rng = f"{sheet_name}!A:Z"
-        resp = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=rng).execute()
-        vals = resp.get("values", [])
-        return vals if isinstance(vals, list) else []
-    except Exception:
-        return None
-
-def _gs_write_values(sheet_id: str, sheet_name: str, values: list[list[str]]) -> bool:
-    svc = _gs_sheets_service()
-    if svc is None:
-        return False
-    try:
-        rng = f"{sheet_name}!A1"
-        body = {"values": values}
-        svc.spreadsheets().values().update(
-            spreadsheetId=sheet_id,
-            range=rng,
-            valueInputOption="RAW",
-            body=body,
-        ).execute()
-        return True
-    except Exception:
-        return False
-
-def _gs_fetch_licenses() -> dict | None:
-    cfg = _gs_get_cfg()
-    if not cfg:
-        return None
-    sheet_id, sheet_name = cfg
-    rows = _gs_read_values(sheet_id, sheet_name)
-    if rows is None:
-        return None
-
-    # If sheet is empty, treat as reachable but empty store
-    if not rows:
-        return {}
-
-    header = [h.strip() for h in (rows[0] or [])]
-    # Minimum required header
-    if not header or header[0].lower() != "license_key":
-        # Not in expected shape; treat as failure so we don't overwrite unknown sheet
-        return None
-
-    # Ensure we can parse a "data" json column if present
-    col_idx = {h: i for i, h in enumerate(header)}
-    data_i = col_idx.get("data")
-
-    store: dict[str, dict] = {}
-    for r in rows[1:]:
-        if not r:
-            continue
-        try:
-            k = (r[col_idx["license_key"]] if col_idx.get("license_key") is not None and len(r) > col_idx["license_key"] else "").strip()
-        except Exception:
-            k = ""
-        if not k:
-            continue
-
-        lic: dict = {}
-        # Prefer full json payload if present
-        if data_i is not None and len(r) > data_i and (r[data_i] or "").strip():
-            try:
-                lic = json.loads(r[data_i])
-                if not isinstance(lic, dict):
-                    lic = {}
-            except Exception:
-                lic = {}
-
-        # Overlay commonly used columns (keeps compatibility with existing logic)
-        def _col(name: str):
-            i = col_idx.get(name)
-            if i is None or i >= len(r):
-                return None
-            v = r[i]
-            return v
-
-        role = _col("role")
-        active = _col("active")
-        white_label = _col("white_label")
-        parent = _col("parent")
-        created_by = _col("created_by")
-        admin_hash = _col("admin_hash")
-        brand = _col("brand")
-        created_utc = _col("created_utc")
-        updated_utc = _col("updated_utc")
-
-        if role is not None and str(role).strip() != "":
-            lic.setdefault("role", str(role).strip())
-        if active is not None and str(active).strip() != "":
-            lic.setdefault("active", str(active).strip().lower() in {"1","true","yes","y","active"})
-        if white_label is not None and str(white_label).strip() != "":
-            lic.setdefault("white_label", str(white_label).strip().lower() in {"1","true","yes","y"})
-        if parent is not None and str(parent).strip() != "":
-            lic.setdefault("parent", str(parent).strip())
-        if created_by is not None and str(created_by).strip() != "":
-            lic.setdefault("created_by", str(created_by).strip())
-        if admin_hash is not None and str(admin_hash).strip() != "":
-            lic.setdefault("admin_hash", str(admin_hash).strip())
-        if brand is not None and str(brand).strip() != "":
-            # brand column may be JSON string
-            try:
-                b = json.loads(brand)
-                if isinstance(b, dict):
-                    lic.setdefault("brand", b)
-            except Exception:
-                pass
-        if created_utc is not None and str(created_utc).strip() != "":
-            lic.setdefault("created_utc", str(created_utc).strip())
-        if updated_utc is not None and str(updated_utc).strip() != "":
-            lic.setdefault("updated_utc", str(updated_utc).strip())
-
-        store[str(k)] = lic
-
-    return store
-
-def _gs_write_licenses(store: dict) -> bool:
-    cfg = _gs_get_cfg()
-    if not cfg:
-        return False
-    sheet_id, sheet_name = cfg
-    existing = _gs_read_values(sheet_id, sheet_name)
-    if existing is None:
-        return False
-
-    # Define canonical header (we will preserve any extra headers by appending ours if missing)
-    base_header = [
-        "license_key","role","active","white_label","parent","created_by","admin_hash","brand","created_utc","updated_utc","data"
-    ]
-
-    header = [h.strip() for h in (existing[0] if existing else [])]
-    if not header or (header and header[0].lower() != "license_key"):
-        header = base_header
-    else:
-        # ensure required columns exist
-        for h in base_header:
-            if h not in header:
-                header.append(h)
-
-    col_idx = {h: i for i, h in enumerate(header)}
-
-    def _bool_str(v: bool) -> str:
-        return "TRUE" if bool(v) else "FALSE"
-
-    out_rows: list[list[str]] = [header]
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    for k, lic in sorted((store or {}).items(), key=lambda kv: str(kv[0])):
-        if not isinstance(lic, dict):
-            continue
-        role = str(lic.get("role") or "client").strip().lower()
-        active = bool(lic.get("active", False))
-        white_label = bool(lic.get("white_label", False))
-        parent = str(lic.get("parent") or "").strip()
-        created_by = str(lic.get("created_by") or "").strip()
-        admin_hash = str(lic.get("admin_hash") or "").strip()
-        brand_obj = lic.get("brand") if isinstance(lic.get("brand"), dict) else None
-        brand_json = json.dumps(brand_obj) if brand_obj is not None else ""
-        created_utc = str(lic.get("created_utc") or "").strip() or now_iso
-        updated_utc = str(lic.get("updated_utc") or "").strip() or now_iso
-        data_json = json.dumps(lic, separators=(",", ":"), ensure_ascii=False)
-
-        row = [""] * len(header)
-        row[col_idx["license_key"]] = str(k)
-        row[col_idx["role"]] = role
-        row[col_idx["active"]] = _bool_str(active)
-        row[col_idx["white_label"]] = _bool_str(white_label)
-        row[col_idx["parent"]] = parent
-        row[col_idx["created_by"]] = created_by
-        row[col_idx["admin_hash"]] = admin_hash
-        row[col_idx["brand"]] = brand_json
-        row[col_idx["created_utc"]] = created_utc
-        row[col_idx["updated_utc"]] = updated_utc
-        row[col_idx["data"]] = data_json
-
-        out_rows.append(row)
-
-    return _gs_write_values(sheet_id, sheet_name, out_rows)
-
-
-def _normalize_supabase_url(url: str) -> str:
-    u = (url or "").strip()
-    if not u:
-        return ""
-    # If someone pasted the dashboard URL, convert it.
-    if "supabase.com/dashboard/project/" in u:
-        try:
-            # .../dashboard/project/<ref>/...
-            ref = u.split("supabase.com/dashboard/project/", 1)[1].split("/", 1)[0]
-            if ref:
-                return f"https://{ref}.supabase.co"
-        except Exception:
-            pass
-    return u
-
-def _get_supabase_client():
-    if create_client is None:
-        return None
-    url = _normalize_supabase_url(_secret_get("SUPABASE_URL"))
-    key = _secret_get("SUPABASE_SERVICE_ROLE_KEY") or _secret_get("SUPABASE_KEY")
-    if not url or not key:
-        return None
-    # Cache per session
-    try:
-        if "_supabase_client" in st.session_state and st.session_state["_supabase_client"]:
-            return st.session_state["_supabase_client"]
-    except Exception:
-        pass
-    try:
-        client = create_client(url, key)  # type: ignore[misc]
-        try:
-            st.session_state["_supabase_client"] = client
-        except Exception:
-            pass
-        return client
-    except Exception:
-        return None
-
-def _sb_resp_data(resp):
-    if resp is None:
-        return None
-    if hasattr(resp, "data"):
-        return resp.data
-    if isinstance(resp, dict):
-        return resp.get("data")
-    return None
-
-def _sb_fetch_licenses() -> dict:
-    client = _get_supabase_client()
-    if client is None:
-        return {}
-    try:
-        resp = client.table("licenses").select("*").execute()
-        rows = _sb_resp_data(resp) or []
-    except Exception:
-        return {}
-
-    store: dict = {}
-    for r in rows or []:
-        try:
-            key = r.get("license_key") or r.get("key")
-            if not key:
-                continue
-            data = r.get("data") or {}
-            lic = data if isinstance(data, dict) else {}
-            # Overlay common columns if present (keeps compatibility with existing app logic)
-            if "status" in r:
-                # Some code uses active True/False; keep both
-                status = str(r.get("status") or "").strip().lower()
-                if status:
-                    lic.setdefault("status", status)
-                    if "active" not in lic:
-                        lic["active"] = (status == "active")
-            if "plan" in r and r.get("plan") is not None:
-                lic.setdefault("plan", r.get("plan"))
-            if "customer" in r and r.get("customer") is not None:
-                lic.setdefault("customer", r.get("customer"))
-            if "notes" in r and r.get("notes") is not None:
-                lic.setdefault("notes", r.get("notes"))
-            if "expires_at" in r and r.get("expires_at") is not None:
-                lic.setdefault("expires_at", r.get("expires_at"))
-            store[str(key)] = lic
-        except Exception:
-            continue
-    return store
-
-def _sb_write_licenses(store: dict) -> bool:
-    client = _get_supabase_client()
-    if client is None:
-        return False
-    try:
-        # Fetch existing keys so we can delete removed ones.
-        resp = client.table("licenses").select("license_key").execute()
-        existing_rows = _sb_resp_data(resp) or []
-        existing = {str(r.get("license_key")) for r in existing_rows if r.get("license_key")}
-    except Exception:
-        existing = set()
-
-    # Upsert all current keys
-    rows = []
-    for k, lic in (store or {}).items():
-        try:
-            licd = lic if isinstance(lic, dict) else {}
-            # Table requires NOT NULL status + plan. Derive sensible defaults.
-            active_flag = licd.get("active")
-            status = licd.get("status")
-            if status is None:
-                if active_flag is None:
-                    status = "active"
-                else:
-                    status = "active" if bool(active_flag) else "inactive"
-            plan = licd.get("plan") or "standard"
-            customer = licd.get("customer")
-            notes = licd.get("notes")
-            expires_at = licd.get("expires_at")
-            rows.append({
-                "license_key": str(k),
-                "status": str(status).lower(),
-                "plan": str(plan),
-                "customer": (str(customer) if customer is not None else None),
-                "notes": (str(notes) if notes is not None else None),
-                "expires_at": expires_at,
-                "data": licd,
-            })
-        except Exception:
-            continue
-        except Exception:
-            continue
-
-    try:
-        if rows:
-            client.table("licenses").upsert(rows).execute()
-    except Exception:
-        return False
-
-    # Delete keys that no longer exist
-    to_delete = list(existing - {str(k) for k in (store or {}).keys()})
-    try:
-        # Supabase has URL size limits; chunk deletes
-        for i in range(0, len(to_delete), 200):
-            chunk = to_delete[i:i+200]
-            if chunk:
-                client.table("licenses").delete().in_("license_key", chunk).execute()
-    except Exception:
-        pass
-
-    return True
-
 # ---------------------------------------------------------------------
 # Branding / UI theming (CUSTOM per tree, no presets)
 # ---------------------------------------------------------------------
@@ -912,22 +511,221 @@ def _gen_admin_code() -> str:
 # ---------------------------------------------------------------------
 # License store + tree permissions
 # ---------------------------------------------------------------------
+def _supabase_client():
+    """Create a Supabase client if configured; otherwise return None."""
+    if not SUPABASE_URL or not SUPABASE_KEY or create_client is None:
+        return None
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        return None
+
+# Cache resolved key column name for the licenses table ("key" or "license_key")
+_LIC_KEY_COL: str | None = None
+
+def _gs_available() -> bool:
+    try:
+        import streamlit as st  # type: ignore
+        _ = st.secrets.get("SHEET_ID")
+        __ = st.secrets.get("SHEET_NAME")
+        ___ = st.secrets.get("GOOGLE_SERVICE_ACCOUNT")
+        return bool(_ and __ and ___)
+    except Exception:
+        return False
+
+
+def _gs_open_worksheet():
+    import streamlit as st  # type: ignore
+    import gspread  # type: ignore
+    from google.oauth2.service_account import Credentials  # type: ignore
+
+    creds_dict = dict(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+    sh = client.open_by_key(st.secrets["SHEET_ID"])
+    ws = sh.worksheet(st.secrets["SHEET_NAME"])
+    return ws
+
+
+def _gs_headers() -> list[str]:
+    # Keep these aligned with your current sheet.
+    return [
+        "license_key",
+        "role",
+        "active",
+        "white_label",
+        "parent",
+        "created_by",
+        "admin_hash",
+        "brand",
+        "created_utc",
+        "updated_utc",
+        "data",
+    ]
+
+
+def _gs_ensure_schema(ws) -> list[str]:
+    # Ensure header row exists and contains required columns (adds missing ones).
+    headers = _gs_headers()
+    try:
+        first_row = ws.row_values(1)
+    except Exception:
+        first_row = []
+    if not first_row:
+        ws.update("A1", [headers])
+        return headers
+
+    # Normalize existing headers and extend if missing.
+    existing = [h.strip() for h in first_row if h is not None]
+    missing = [h for h in headers if h not in existing]
+    if missing:
+        ws.update("A1", [existing + missing])
+        return existing + missing
+    return existing
+
+
+def _gs_fetch_licenses() -> dict:
+    if not _gs_available():
+        return {}
+    try:
+        ws = _gs_open_worksheet()
+        headers = _gs_ensure_schema(ws)
+        records = ws.get_all_records(expected_headers=headers)
+        out: dict[str, dict] = {}
+        for r in records:
+            k = str(r.get("license_key") or "").strip()
+            if not k:
+                continue
+
+            # Parse booleans
+            active = r.get("active")
+            if isinstance(active, str):
+                active = active.strip().lower() in {"true", "1", "yes", "y"}
+            active = bool(active)
+
+            wl = r.get("white_label")
+            if isinstance(wl, str):
+                wl = wl.strip().lower() in {"true", "1", "yes", "y"}
+            wl = bool(wl) if wl is not None else False
+
+            lic = {
+                "role": (r.get("role") or "client"),
+                "active": active,
+                "white_label": wl,
+                "parent": (r.get("parent") or None) or None,
+                "created_by": (r.get("created_by") or None) or None,
+                "admin_hash": (r.get("admin_hash") or None) or None,
+                "created_utc": (r.get("created_utc") or None) or None,
+                "updated_utc": (r.get("updated_utc") or None) or None,
+            }
+
+            # brand may be JSON
+            brand_raw = r.get("brand")
+            if isinstance(brand_raw, str) and brand_raw.strip():
+                try:
+                    lic["brand"] = json.loads(brand_raw)
+                except Exception:
+                    lic["brand"] = brand_raw
+            elif brand_raw:
+                lic["brand"] = brand_raw
+
+            # data column stores full payload (JSON)
+            data_raw = r.get("data")
+            if isinstance(data_raw, str) and data_raw.strip():
+                try:
+                    extra = json.loads(data_raw)
+                    if isinstance(extra, dict):
+                        lic.update(extra)
+                except Exception:
+                    pass
+
+            out[k] = lic
+        return out
+    except Exception as e:
+        try:
+            print(f"[licenses] Google Sheets read failed: {e}")
+        except Exception:
+            pass
+        return {}
+
+
+def _gs_write_licenses(store: dict) -> bool:
+    if not _gs_available():
+        return False
+    try:
+        ws = _gs_open_worksheet()
+        headers = _gs_ensure_schema(ws)
+
+        # rewrite entire sheet (simple + consistent)
+        rows = []
+        now = datetime.now(timezone.utc).isoformat()
+
+        def _as_json(v) -> str:
+            try:
+                return json.dumps(v, ensure_ascii=False)
+            except Exception:
+                return ""
+
+        for k, v in (store or {}).items():
+            if not isinstance(v, dict):
+                continue
+            role = v.get("role") or "client"
+            active = bool(v.get("active", False))
+            wl = bool(v.get("white_label", False))
+            parent = v.get("parent") or ""
+            created_by = v.get("created_by") or ""
+            admin_hash = v.get("admin_hash") or ""
+            brand = v.get("brand")
+            created_utc = v.get("created_utc") or now
+            updated_utc = now
+
+            # Store full dict in data column to preserve everything.
+            data_json = _as_json(v)
+
+            row_map = {
+                "license_key": k,
+                "role": role,
+                "active": "TRUE" if active else "FALSE",
+                "white_label": "TRUE" if wl else "FALSE",
+                "parent": parent,
+                "created_by": created_by,
+                "admin_hash": admin_hash,
+                "brand": _as_json(brand) if isinstance(brand, (dict, list)) else (brand or ""),
+                "created_utc": created_utc,
+                "updated_utc": updated_utc,
+                "data": data_json,
+            }
+            rows.append([row_map.get(h, "") for h in headers])
+
+        ws.clear()
+        ws.update("A1", [headers])
+        if rows:
+            ws.append_rows(rows, value_input_option="RAW")
+        return True
+    except Exception as e:
+        try:
+            print(f"[licenses] Google Sheets write failed: {e}")
+        except Exception:
+            pass
+        return False
+
+
 def _lic_load() -> dict:
-    """
-    Source of truth order:
-    1) Google Sheets (service account) if configured (SHEET_ID + GOOGLE_SERVICE_ACCOUNT)
-    2) Supabase (optional) if configured
-    3) Local JSON (local dev fallback only)
-    """
+    # Primary: Google Sheets (durable on Streamlit Cloud)
     gs = _gs_fetch_licenses()
-    if gs is not None:
+    if gs:
         return gs
 
+    # Secondary: Supabase if configured (optional)
     sb = _sb_fetch_licenses()
     if sb:
         return sb
 
-    # Streamlit Cloud filesystem is ephemeral; JSON is only a fallback for local dev.
+    # Last resort: local JSON (ONLY reliable for local dev)
     if not os.path.exists(LICENSE_FILE):
         try:
             with open(LICENSE_FILE, "w", encoding="utf-8") as f:
@@ -941,17 +739,17 @@ def _lic_load() -> dict:
     except Exception:
         return {}
 
-def _lic_save(store: dict):
-    # Write to Google Sheets if possible; otherwise fall back.
-    try:
-        if _gs_write_licenses(store):
-            return
-    except Exception:
-        pass
 
+def _lic_save(store: dict):
+    # Primary: Google Sheets
+    if _gs_write_licenses(store):
+        return
+
+    # Secondary: Supabase
     if _sb_write_licenses(store):
         return
 
+    # Last resort: local JSON
     tmp = LICENSE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(store, f, indent=2)
